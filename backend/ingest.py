@@ -50,10 +50,6 @@ def clone_repository(repo_url: str):
             "Vérifie l'URL ou réessaie plus tard."
         )
     except subprocess.CalledProcessError as e:
-        print(f"[DEBUG clone_repository] str(e)={e!r}", flush=True)
-        print(f"[DEBUG clone_repository] e.returncode={e.returncode}", flush=True)
-        print(f"[DEBUG clone_repository] e.stderr={e.stderr!r}", flush=True)
-        print(f"[DEBUG clone_repository] e.stdout={e.stdout!r}", flush=True)
         shutil.rmtree(repo_path, ignore_errors=True)
         raise RepoCloneError(
             "Impossible de cloner le repository. Vérifie que l'URL est "

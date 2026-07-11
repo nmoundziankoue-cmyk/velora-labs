@@ -1,6 +1,9 @@
 import json
 import os
+import shutil
 import sys
+import time
+from collections import defaultdict
 
 from dotenv import load_dotenv
 
@@ -23,7 +26,7 @@ if not os.environ.get("GEMINI_API_KEY", "").strip():
         "gratuite sur ai.google.dev et exporte-la avant de lancer le serveur."
     )
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -75,6 +78,27 @@ def save_repos_state():
 
 repos = load_repos_state()
 
+# ===== PROTECTION D'USAGE PUBLIC =====
+# Démo publique = pas d'auth. Deux garde-fous simples pour éviter qu'un pic
+# de trafic ne clone un repo énorme ou n'épuise le quota Gemini gratuit.
+MAX_FILES_PER_REPO = 50
+
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS = 5
+_rate_limit_hits = defaultdict(list)
+
+def enforce_rate_limit(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    hits = _rate_limit_hits[ip]
+    hits[:] = [t for t in hits if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    if len(hits) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many requests. Limit: {RATE_LIMIT_MAX_REQUESTS} per {RATE_LIMIT_WINDOW_SECONDS}s. Try again shortly.",
+        )
+    hits.append(now)
+
 # ===== ROUTES =====
 
 @app.get("/")
@@ -83,7 +107,8 @@ def root():
 
 # 🔥 1. INGEST + INDEX AUTO
 @app.post("/repo")
-def create_repo(req: RepoRequest):
+def create_repo(req: RepoRequest, request: Request):
+    enforce_rate_limit(request)
 
     try:
         repo_id, repo_path = clone_repository(req.repo_url)
@@ -91,6 +116,16 @@ def create_repo(req: RepoRequest):
         return JSONResponse(status_code=400, content={"error": str(e)})
 
     files = get_code_files(repo_path)
+
+    if len(files) > MAX_FILES_PER_REPO:
+        shutil.rmtree(repo_path, ignore_errors=True)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Repo too large ({len(files)} files, max {MAX_FILES_PER_REPO} "
+                f"for this demo). Try a smaller repo."
+            },
+        )
 
     # 🔥 INDEX DIRECT
     index_result = index_repository(repo_id, repo_path)
@@ -111,7 +146,8 @@ def create_repo(req: RepoRequest):
 
 # 🔥 2. ASK DIRECT
 @app.post("/ask")
-def ask(req: AskRequest):
+def ask(req: AskRequest, request: Request):
+    enforce_rate_limit(request)
 
     if req.repo_id not in repos:
         return {"error": "repo not found"}

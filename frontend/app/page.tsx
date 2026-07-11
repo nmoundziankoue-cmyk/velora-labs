@@ -30,7 +30,7 @@ export default function DashboardPage() {
   async function ingestAndIndexRepo() {
     try {
       setLoading(true);
-      setStatus("Ingesting and indexing repo...");
+      setStatus("Ingesting and indexing repo — this can take a minute for larger repos...");
       setAnswer("");
 
       const repoRes = await fetch(`${API_BASE}/repo`, {
@@ -125,14 +125,21 @@ export default function DashboardPage() {
           style={{
             marginLeft: 10,
             padding: 10,
-            background: "black",
+            background: "#4F46E5",
             color: "white",
             borderRadius: 6,
             border: "none",
             cursor: "pointer",
           }}
         >
-          {loading ? "Loading..." : "Ingest Repo"}
+          {loading ? (
+            <>
+              <span className="spinner" />
+              Working...
+            </>
+          ) : (
+            "Ingest Repo"
+          )}
         </button>
       </div>
 
@@ -172,14 +179,21 @@ export default function DashboardPage() {
           style={{
             marginLeft: 10,
             padding: 10,
-            background: "black",
+            background: "#4F46E5",
             color: "white",
             borderRadius: 6,
             border: "none",
             cursor: "pointer",
           }}
         >
-          Ask
+          {loading ? (
+            <>
+              <span className="spinner" />
+              Working...
+            </>
+          ) : (
+            "Ask"
+          )}
         </button>
       </div>
 
