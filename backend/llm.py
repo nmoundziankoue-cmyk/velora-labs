@@ -22,9 +22,12 @@ Instructions:
 """
 
 
+class GenerationError(Exception):
+    """Levée quand l'appel au modèle Gemini échoue (quota, indisponibilité, etc.)."""
+
+
 def generate_answer(question: str, context: str):
-    try:
-        user_prompt = f"""
+    user_prompt = f"""
 Repository context:
 {context}
 
@@ -44,6 +47,7 @@ Explanation:
 <short explanation>
 """
 
+    try:
         response = client.models.generate_content(
             model=CHAT_MODEL,
             contents=user_prompt,
@@ -52,8 +56,7 @@ Explanation:
                 temperature=0.2,
             ),
         )
-
-        return response.text
-
     except Exception as e:
-        return f"Error generating answer: {str(e)}"
+        raise GenerationError(str(e)) from e
+
+    return response.text

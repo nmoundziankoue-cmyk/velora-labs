@@ -29,10 +29,10 @@ if not os.environ.get("GEMINI_API_KEY", "").strip():
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from ingest import clone_repository, get_code_files, index_repository, RepoCloneError
-from retrieval import retrieve_context
-from llm import generate_answer
+from retrieval import retrieve_context, RetrievalError
+from llm import generate_answer, GenerationError
 
 app = FastAPI(title="Velora API")
 
@@ -59,9 +59,23 @@ app.add_middleware(
 class RepoRequest(BaseModel):
     repo_url: str
 
+    @field_validator("repo_url")
+    @classmethod
+    def repo_url_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("repo_url must not be empty")
+        return v
+
 class AskRequest(BaseModel):
     repo_id: str
     question: str
+
+    @field_validator("question")
+    @classmethod
+    def question_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("question must not be empty")
+        return v
 
 # ===== STATE (persisté dans un fichier JSON) =====
 REPOS_STATE_FILE = "repos_state.json"
@@ -84,7 +98,7 @@ repos = load_repos_state()
 MAX_FILES_PER_REPO = 50
 
 RATE_LIMIT_WINDOW_SECONDS = 60
-RATE_LIMIT_MAX_REQUESTS = 5
+RATE_LIMIT_MAX_REQUESTS = 20
 _rate_limit_hits = defaultdict(list)
 
 def enforce_rate_limit(request: Request):
@@ -105,7 +119,6 @@ def enforce_rate_limit(request: Request):
 def root():
     return {"status": "Velora running 🚀"}
 
-# 🔥 1. INGEST + INDEX AUTO
 @app.post("/repo")
 def create_repo(req: RepoRequest, request: Request):
     enforce_rate_limit(request)
@@ -127,8 +140,17 @@ def create_repo(req: RepoRequest, request: Request):
             },
         )
 
-    # 🔥 INDEX DIRECT
     index_result = index_repository(repo_id, repo_path)
+
+    if index_result["total_chunks"] == 0:
+        shutil.rmtree(repo_path, ignore_errors=True)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "Indexing failed for every file (likely a temporary Gemini "
+                "API issue). Try again in a moment."
+            },
+        )
 
     repos[repo_id] = {
         "repo_url": req.repo_url,
@@ -141,20 +163,26 @@ def create_repo(req: RepoRequest, request: Request):
     return {
         "repo_id": repo_id,
         "files_found": len(files),
+        "indexed_files": index_result["indexed_files"],
+        "total_chunks": index_result["total_chunks"],
         "status": "ready"
     }
 
-# 🔥 2. ASK DIRECT
 @app.post("/ask")
 def ask(req: AskRequest, request: Request):
     enforce_rate_limit(request)
 
     if req.repo_id not in repos:
-        return {"error": "repo not found"}
+        return JSONResponse(status_code=404, content={"error": "repo not found"})
 
-    context, sources = retrieve_context(req.question, repo_id=req.repo_id)
-
-    answer = generate_answer(req.question, context)
+    try:
+        context, sources = retrieve_context(req.question, repo_id=req.repo_id)
+        answer = generate_answer(req.question, context)
+    except (RetrievalError, GenerationError) as e:
+        return JSONResponse(
+            status_code=502,
+            content={"error": f"AI service is temporarily unavailable: {str(e)}"},
+        )
 
     return {
         "answer": answer,
