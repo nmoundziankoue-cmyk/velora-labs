@@ -29,6 +29,18 @@ ALLOWED_EXTENSIONS = {
 # (vendor/, dist/ buildé, etc.) et exploser le nombre de fichiers/chunks.
 EXCLUDED_DIRS = {"node_modules", "dist", "build", ".next", "target", "vendor", "venv"}
 
+# Lockfiles générés automatiquement : des milliers de lignes de JSON/YAML
+# plat, aucune valeur pour une analyse d'architecture, mais des centaines
+# de chunks gaspillés en appels d'embedding.
+EXCLUDED_FILENAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock",
+}
+
+# Un seul fichier généré/minifié massif peut à lui seul produire des
+# centaines de chunks alors que MAX_FILES_PER_REPO ne compte que les
+# fichiers, pas les chunks.
+MAX_FILE_SIZE_BYTES = 300 * 1024
+
 
 class RepoCloneError(Exception):
     """Levée quand `git clone` échoue (URL invalide, repo privé/inexistant, timeout)."""
@@ -74,9 +86,21 @@ def get_code_files(repo_path: str):
         dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
 
         for file in files:
+            if file in EXCLUDED_FILENAMES:
+                continue
+
             ext = os.path.splitext(file)[1]
-            if ext in ALLOWED_EXTENSIONS:
-                code_files.append(os.path.join(root, file))
+            if ext not in ALLOWED_EXTENSIONS:
+                continue
+
+            path = os.path.join(root, file)
+            try:
+                if os.path.getsize(path) > MAX_FILE_SIZE_BYTES:
+                    continue
+            except OSError:
+                continue
+
+            code_files.append(path)
 
     return code_files
 
