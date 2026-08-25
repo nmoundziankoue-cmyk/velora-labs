@@ -30,7 +30,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
-from ingest import clone_repository, get_code_files, index_repository, RepoCloneError
+from ingest import ALLOWED_EXTENSIONS, clone_repository, get_code_files, index_repository, RepoCloneError
 from retrieval import retrieve_context, RetrievalError
 from llm import generate_answer, GenerationError
 
@@ -137,6 +137,17 @@ def create_repo(req: RepoRequest, request: Request):
             content={
                 "error": f"Repo too large ({len(files)} files, max {MAX_FILES_PER_REPO} "
                 f"for this demo). Try a smaller repo."
+            },
+        )
+
+    if len(files) == 0:
+        shutil.rmtree(repo_path, ignore_errors=True)
+        extensions = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"No supported source files found in this repository. "
+                f"Supported extensions: {extensions}."
             },
         )
 

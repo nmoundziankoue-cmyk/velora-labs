@@ -97,17 +97,18 @@ def index_repository(repo_id: str, repo_path: str):
                 continue
 
             chunks = chunk_text(content)
+            relative_path = os.path.relpath(path, repo_path)
 
             for i, chunk in enumerate(chunks):
                 embedding = embed_text(chunk)
 
                 add_chunk(
-                    chunk_id=f"{repo_id}:{path}:{i}",
+                    chunk_id=f"{repo_id}:{relative_path}:{i}",
                     text=chunk,
                     embedding=embedding,
                     metadata={
                         "repo_id": repo_id,
-                        "path": path,
+                        "path": relative_path,
                         "chunk_index": i,
                     },
                 )
