@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 type RepoResponse = {
   repo_id: string;
@@ -23,6 +23,16 @@ type AskResponse = {
 
 const ACCENT = "#4F46E5";
 
+// Repos réels : l'indexing peut prendre 1-2 min. Un statut qui bouge évite
+// l'impression de freeze pendant l'attente.
+const INDEXING_STAGE_MESSAGES = [
+  "Cloning the repository...",
+  "Reading source files...",
+  "Generating embeddings...",
+  "Almost done...",
+];
+const INDEXING_STAGE_INTERVAL_MS = 6000;
+
 export default function HomePage() {
   const [repoUrl, setRepoUrl] = useState("https://github.com/vercel/next.js");
   const [repoId, setRepoId] = useState("");
@@ -34,6 +44,7 @@ export default function HomePage() {
   const [sources, setSources] = useState<Source[]>([]);
   const [loadingRepo, setLoadingRepo] = useState(false);
   const [loadingAsk, setLoadingAsk] = useState(false);
+  const stageIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
@@ -50,10 +61,16 @@ export default function HomePage() {
 
     try {
       setLoadingRepo(true);
-      setStatus("Ingesting and indexing repo — this can take a minute for larger repos...");
       setAnswer("");
       setAnswerError(false);
       setSources([]);
+
+      let stageIndex = 0;
+      setStatus(INDEXING_STAGE_MESSAGES[stageIndex]);
+      stageIntervalRef.current = setInterval(() => {
+        stageIndex = Math.min(stageIndex + 1, INDEXING_STAGE_MESSAGES.length - 1);
+        setStatus(INDEXING_STAGE_MESSAGES[stageIndex]);
+      }, INDEXING_STAGE_INTERVAL_MS);
 
       const repoRes = await fetch(`${API_BASE}/repo`, {
         method: "POST",
@@ -81,6 +98,10 @@ export default function HomePage() {
     } catch {
       setStatus("Could not reach the backend. Check your connection and try again.");
     } finally {
+      if (stageIntervalRef.current) {
+        clearInterval(stageIntervalRef.current);
+        stageIntervalRef.current = null;
+      }
       setLoadingRepo(false);
     }
   }
