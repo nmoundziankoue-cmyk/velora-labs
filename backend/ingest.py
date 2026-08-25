@@ -21,8 +21,13 @@ ALLOWED_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx",
     ".html", ".css", ".json", ".md",
     ".java", ".go", ".rs", ".cpp", ".c",
-    ".cs", ".rb", ".php"
+    ".cs", ".rb", ".php",
+    ".yml", ".yaml", ".sql", ".tf", ".kt", ".swift", ".vue",
 }
+
+# Fichiers de config/build conventionnellement sans extension : une
+# extension seule ne les capte pas, donc whitelist explicite par nom.
+ALLOWED_FILENAMES = {"Dockerfile", "Makefile"}
 
 # Dossiers de dépendances/build qui ne contiennent jamais de code source
 # pertinent à analyser, mais qui peuvent être committés dans certains repos
@@ -90,7 +95,7 @@ def get_code_files(repo_path: str):
                 continue
 
             ext = os.path.splitext(file)[1]
-            if ext not in ALLOWED_EXTENSIONS:
+            if ext not in ALLOWED_EXTENSIONS and file not in ALLOWED_FILENAMES:
                 continue
 
             path = os.path.join(root, file)
