@@ -1,4 +1,5 @@
 import os
+import time
 
 from google import genai
 from google.genai import types
@@ -6,6 +7,10 @@ from google.genai import types
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 CHAT_MODEL = "gemini-flash-latest"
+
+# Absorbe les erreurs transitoires (ex: 503 "model overloaded") sans faire
+# remonter une erreur brute au prospect pour un blip réseau/quota Gemini.
+RETRY_BACKOFF_SECONDS = (1, 3)
 
 SYSTEM_PROMPT = """
 You are Velora, a high-end AI engineering assistant.
@@ -47,16 +52,23 @@ Explanation:
 <short explanation>
 """
 
-    try:
-        response = client.models.generate_content(
-            model=CHAT_MODEL,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.2,
-            ),
-        )
-    except Exception as e:
-        raise GenerationError(str(e)) from e
+    last_error = None
 
-    return response.text
+    for delay in (0,) + RETRY_BACKOFF_SECONDS:
+        if delay:
+            time.sleep(delay)
+
+        try:
+            response = client.models.generate_content(
+                model=CHAT_MODEL,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.2,
+                ),
+            )
+            return response.text
+        except Exception as e:
+            last_error = e
+
+    raise GenerationError(str(last_error)) from last_error
