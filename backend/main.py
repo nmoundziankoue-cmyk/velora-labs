@@ -95,7 +95,7 @@ repos = load_repos_state()
 # ===== PROTECTION D'USAGE PUBLIC =====
 # Démo publique = pas d'auth. Deux garde-fous simples pour éviter qu'un pic
 # de trafic ne clone un repo énorme ou n'épuise le quota Gemini gratuit.
-MAX_FILES_PER_REPO = 50
+MAX_FILES_PER_REPO = 1000
 
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_MAX_REQUESTS = 20

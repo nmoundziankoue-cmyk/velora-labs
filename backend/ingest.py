@@ -24,6 +24,11 @@ ALLOWED_EXTENSIONS = {
     ".cs", ".rb", ".php"
 }
 
+# Dossiers de dépendances/build qui ne contiennent jamais de code source
+# pertinent à analyser, mais qui peuvent être committés dans certains repos
+# (vendor/, dist/ buildé, etc.) et exploser le nombre de fichiers/chunks.
+EXCLUDED_DIRS = {"node_modules", "dist", "build", ".next", "target", "vendor", "venv"}
+
 
 class RepoCloneError(Exception):
     """Levée quand `git clone` échoue (URL invalide, repo privé/inexistant, timeout)."""
@@ -62,7 +67,12 @@ def clone_repository(repo_url: str):
 def get_code_files(repo_path: str):
     code_files = []
 
-    for root, _, files in os.walk(repo_path):
+    for root, dirs, files in os.walk(repo_path):
+        # Élague les dossiers exclus avant d'y descendre : plus rapide que
+        # filtrer après coup, et évite de scanner potentiellement des
+        # dizaines de milliers de fichiers dans node_modules/.git/etc.
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
+
         for file in files:
             ext = os.path.splitext(file)[1]
             if ext in ALLOWED_EXTENSIONS:
