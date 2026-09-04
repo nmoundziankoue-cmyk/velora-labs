@@ -1,18 +1,28 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
-type RepoResponse = {
+type RepoQueuedResponse = {
   repo_id: string;
-  files_found: number;
+  status: string;
+};
+
+type RepoStage = "queued" | "cloning" | "reading_files" | "indexing" | "ready" | "error";
+
+type RepoStatusResponse = {
+  repo_id: string;
+  stage: RepoStage;
+  files_found: number | null;
   indexed_files: number;
   total_chunks: number;
-  status: string;
+  error: string | null;
 };
 
 type Source = {
   path: string;
   chunk_index: number;
+  line_start: number | null;
+  line_end: number | null;
 };
 
 type AskResponse = {
@@ -23,19 +33,38 @@ type AskResponse = {
 
 const ACCENT = "#4F46E5";
 
-// Repos réels : l'indexing peut prendre 1-2 min. Un statut qui bouge évite
-// l'impression de freeze pendant l'attente.
-const INDEXING_STAGE_MESSAGES = [
-  "Cloning the repository...",
-  "Reading source files...",
-  "Generating embeddings...",
-  "Almost done...",
-];
-const INDEXING_STAGE_INTERVAL_MS = 6000;
+// Indexation réelle : le backend indexe en arrière-plan (voir POST /repo,
+// qui répond 202 immédiatement) et ce frontend interroge son statut réel via
+// GET /repo/{id}/status — plus de minuteur cosmétique déconnecté du backend.
+const POLL_INTERVAL_MS = 2000;
+
+const STAGE_LABELS: Record<RepoStage, string> = {
+  queued: "Queued...",
+  cloning: "Cloning the repository...",
+  reading_files: "Reading source files...",
+  indexing: "Indexing files...",
+  ready: "Ready.",
+  error: "Error.",
+};
+
+function formatSourceLocation(source: Source): string {
+  if (source.line_start == null || source.line_end == null) {
+    // Filet de sécurité si jamais line_start/line_end manquent (ne devrait
+    // pas arriver : le backend les propage depuis l'Étape 2 du chunker
+    // ligne-aware) — mieux vaut afficher le chunk que rien du tout.
+    return `chunk ${source.chunk_index}`;
+  }
+  if (source.line_start === source.line_end) {
+    return `line ${source.line_start}`;
+  }
+  return `lines ${source.line_start}-${source.line_end}`;
+}
 
 export default function HomePage() {
   const [repoUrl, setRepoUrl] = useState("https://github.com/vercel/next.js");
+  const [accessToken, setAccessToken] = useState("");
   const [repoId, setRepoId] = useState("");
+  const [pollingRepoId, setPollingRepoId] = useState<string | null>(null);
   const [question, setQuestion] = useState("");
   const [status, setStatus] = useState("Idle");
   const [filesFound, setFilesFound] = useState<number | null>(null);
@@ -44,9 +73,70 @@ export default function HomePage() {
   const [sources, setSources] = useState<Source[]>([]);
   const [loadingRepo, setLoadingRepo] = useState(false);
   const [loadingAsk, setLoadingAsk] = useState(false);
-  const stageIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+
+  useEffect(() => {
+    if (!pollingRepoId) return;
+
+    let cancelled = false;
+
+    async function pollOnce() {
+      let res: Response;
+      try {
+        res = await fetch(`${API_BASE}/repo/${pollingRepoId}/status`);
+      } catch {
+        if (!cancelled) {
+          setStatus("Lost connection while checking indexing progress. Retrying...");
+        }
+        return;
+      }
+      if (cancelled) return;
+
+      const data = (await readJsonSafely(res)) as RepoStatusResponse | null;
+
+      if (!res.ok || !data) {
+        setStatus("Lost track of indexing progress. Please try again.");
+        setLoadingRepo(false);
+        setPollingRepoId(null);
+        return;
+      }
+
+      if (data.stage === "error") {
+        setStatus(data.error ?? "Indexing failed. Please try again.");
+        setLoadingRepo(false);
+        setPollingRepoId(null);
+        return;
+      }
+
+      if (data.stage === "ready") {
+        setRepoId(data.repo_id);
+        setFilesFound(data.files_found);
+        setStatus(
+          `Repo ready — ${data.indexed_files}/${data.files_found} files indexed (${data.total_chunks} chunks). You can ask questions.`
+        );
+        setLoadingRepo(false);
+        setPollingRepoId(null);
+        return;
+      }
+
+      if (data.stage === "indexing" && data.files_found) {
+        setStatus(
+          `Indexing files... ${data.indexed_files}/${data.files_found} (${data.total_chunks} chunks so far)`
+        );
+      } else {
+        setStatus(STAGE_LABELS[data.stage]);
+      }
+    }
+
+    pollOnce();
+    const intervalId = setInterval(pollOnce, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [pollingRepoId, API_BASE]);
 
   async function readJsonSafely(res: Response) {
     try {
@@ -59,18 +149,21 @@ export default function HomePage() {
   async function ingestAndIndexRepo() {
     if (!repoUrl.trim() || loadingRepo) return;
 
+    // Garde-fou minimal, pas une validation de format : un token non vide
+    // qui devient vide après trim(), ou qui contient un espace/saut de
+    // ligne, trahit presque toujours une erreur de copier-coller.
+    const trimmedToken = accessToken.trim();
+    if (accessToken && (!trimmedToken || /\s/.test(trimmedToken))) {
+      setStatus("GitHub token looks off — empty after trimming, or contains a space/newline.");
+      return;
+    }
+
     try {
       setLoadingRepo(true);
+      setStatus("Queuing repository...");
       setAnswer("");
       setAnswerError(false);
       setSources([]);
-
-      let stageIndex = 0;
-      setStatus(INDEXING_STAGE_MESSAGES[stageIndex]);
-      stageIntervalRef.current = setInterval(() => {
-        stageIndex = Math.min(stageIndex + 1, INDEXING_STAGE_MESSAGES.length - 1);
-        setStatus(INDEXING_STAGE_MESSAGES[stageIndex]);
-      }, INDEXING_STAGE_INTERVAL_MS);
 
       const repoRes = await fetch(`${API_BASE}/repo`, {
         method: "POST",
@@ -79,30 +172,30 @@ export default function HomePage() {
         },
         body: JSON.stringify({
           repo_url: repoUrl,
+          ...(trimmedToken ? { access_token: trimmedToken } : {}),
         }),
       });
 
-      const repoData = await readJsonSafely(repoRes);
+      const repoData = (await readJsonSafely(repoRes)) as RepoQueuedResponse | null;
 
-      if (!repoRes.ok) {
-        setStatus(repoData?.error ?? "Repo ingestion failed. Please try again.");
+      if (!repoRes.ok || !repoData) {
+        setStatus((repoData as { error?: string } | null)?.error ?? "Repo ingestion failed. Please try again.");
+        setLoadingRepo(false);
         return;
       }
 
-      const data = repoData as RepoResponse;
-      setRepoId(data.repo_id);
-      setFilesFound(data.files_found);
-      setStatus(
-        `Repo ready — ${data.indexed_files}/${data.files_found} files indexed (${data.total_chunks} chunks). You can ask questions.`
-      );
+      // La suite (cloning → indexing → ready) est suivie par l'effet de
+      // polling ci-dessus, qui remet loadingRepo à false une fois le job
+      // terminé (succès ou erreur) — pas ce bloc.
+      setPollingRepoId(repoData.repo_id);
     } catch {
       setStatus("Could not reach the backend. Check your connection and try again.");
-    } finally {
-      if (stageIntervalRef.current) {
-        clearInterval(stageIntervalRef.current);
-        stageIntervalRef.current = null;
-      }
       setLoadingRepo(false);
+    } finally {
+      // Jamais conservé au-delà d'une tentative : le champ se vide que la
+      // requête réussisse ou échoue (cohérent avec la politique "jamais
+      // persisté" côté backend — voir POLICY.md).
+      setAccessToken("");
     }
   }
 
@@ -162,7 +255,7 @@ export default function HomePage() {
           Velora <span style={{ color: ACCENT }}>Labs</span>
         </h1>
         <p style={{ marginTop: 6, color: "#555" }}>
-          Point it at a public GitHub repo, then ask questions about the actual code.
+          Point it at a public or private GitHub repo, then ask questions about the actual code.
         </p>
       </header>
 
@@ -211,6 +304,42 @@ export default function HomePage() {
               "Ingest Repo"
             )}
           </button>
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          <label htmlFor="access-token" style={{ fontSize: 13, fontWeight: 600, color: "#333" }}>
+            GitHub token (optional — private repos only)
+          </label>
+          <input
+            id="access-token"
+            type="password"
+            value={accessToken}
+            onChange={(e) => setAccessToken(e.target.value)}
+            placeholder="ghp_... or github_pat_..."
+            autoComplete="off"
+            style={{
+              marginTop: 6,
+              width: "100%",
+              padding: 10,
+              border: "1px solid #ccc",
+              borderRadius: 8,
+              fontSize: 14,
+            }}
+          />
+          <p style={{ marginTop: 6, fontSize: 12.5, color: "#777" }}>
+            Only needed for private repositories. Use the most restrictive read-only scope
+            available — a fine-grained token scoped to &quot;Contents: Read-only&quot; on this
+            repo, or classic <code>repo</code> read access if your org requires classic tokens.{" "}
+            <a
+              href="https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens"
+              target="_blank"
+              rel="noreferrer"
+            >
+              How to create one
+            </a>
+            . The token is used in memory only, for this clone, then discarded immediately —
+            never stored, never logged. This field clears itself after each attempt.
+          </p>
         </div>
 
         <div style={{ marginTop: 14, fontSize: 14, color: "#333" }}>
@@ -310,7 +439,8 @@ export default function HomePage() {
                 <ul style={{ marginTop: 6, paddingLeft: 18, fontSize: 13, color: "#555" }}>
                   {sources.map((s, i) => (
                     <li key={`${s.path}-${s.chunk_index}-${i}`}>
-                      {s.path} <span style={{ color: "#999" }}>(chunk {s.chunk_index})</span>
+                      {s.path}{" "}
+                      <span style={{ color: "#999" }}>({formatSourceLocation(s)})</span>
                     </li>
                   ))}
                 </ul>
