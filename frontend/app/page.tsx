@@ -31,6 +31,11 @@ type AskResponse = {
   error?: string;
 };
 
+type CurrentUser = {
+  id: string;
+  github_login: string;
+};
+
 const ACCENT = "#4F46E5";
 
 // Indexation réelle : le backend indexe en arrière-plan (voir POST /repo,
@@ -73,8 +78,47 @@ export default function HomePage() {
   const [sources, setSources] = useState<Source[]>([]);
   const [loadingRepo, setLoadingRepo] = useState(false);
   const [loadingAsk, setLoadingAsk] = useState(false);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkAuth() {
+      try {
+        const res = await fetch(`${API_BASE}/auth/me`, { credentials: "include" });
+        if (cancelled) return;
+        if (res.ok) {
+          setCurrentUser((await res.json()) as CurrentUser);
+        } else {
+          setCurrentUser(null);
+        }
+      } catch {
+        if (!cancelled) setCurrentUser(null);
+      } finally {
+        if (!cancelled) setAuthChecked(true);
+      }
+    }
+
+    checkAuth();
+    return () => {
+      cancelled = true;
+    };
+  }, [API_BASE]);
+
+  async function logOut() {
+    try {
+      await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "include" });
+    } catch {
+      // Rien de plus à faire : on efface l'état local dans tous les cas ci-dessous.
+    }
+    setCurrentUser(null);
+    setRepoId("");
+    setPollingRepoId(null);
+    setStatus("Idle");
+  }
 
   useEffect(() => {
     if (!pollingRepoId) return;
@@ -84,7 +128,7 @@ export default function HomePage() {
     async function pollOnce() {
       let res: Response;
       try {
-        res = await fetch(`${API_BASE}/repo/${pollingRepoId}/status`);
+        res = await fetch(`${API_BASE}/repo/${pollingRepoId}/status`, { credentials: "include" });
       } catch {
         if (!cancelled) {
           setStatus("Lost connection while checking indexing progress. Retrying...");
@@ -147,7 +191,7 @@ export default function HomePage() {
   }
 
   async function ingestAndIndexRepo() {
-    if (!repoUrl.trim() || loadingRepo) return;
+    if (!repoUrl.trim() || loadingRepo || !currentUser) return;
 
     // Garde-fou minimal, pas une validation de format : un token non vide
     // qui devient vide après trim(), ou qui contient un espace/saut de
@@ -167,6 +211,7 @@ export default function HomePage() {
 
       const repoRes = await fetch(`${API_BASE}/repo`, {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
         },
@@ -175,6 +220,13 @@ export default function HomePage() {
           ...(trimmedToken ? { access_token: trimmedToken } : {}),
         }),
       });
+
+      if (repoRes.status === 401) {
+        setStatus("Your session expired. Please log in again.");
+        setCurrentUser(null);
+        setLoadingRepo(false);
+        return;
+      }
 
       const repoData = (await readJsonSafely(repoRes)) as RepoQueuedResponse | null;
 
@@ -211,6 +263,7 @@ export default function HomePage() {
 
       const askRes = await fetch(`${API_BASE}/ask`, {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
         },
@@ -219,6 +272,14 @@ export default function HomePage() {
           question,
         }),
       });
+
+      if (askRes.status === 401) {
+        setAnswerError(true);
+        setAnswer("Your session expired. Please log in again.");
+        setStatus("Error.");
+        setCurrentUser(null);
+        return;
+      }
 
       const askData = (await readJsonSafely(askRes)) as AskResponse | null;
 
@@ -250,14 +311,82 @@ export default function HomePage() {
         fontFamily: "system-ui, sans-serif",
       }}
     >
-      <header style={{ marginBottom: 32 }}>
-        <h1 style={{ margin: 0, fontSize: 28 }}>
-          Velora <span style={{ color: ACCENT }}>Labs</span>
-        </h1>
-        <p style={{ marginTop: 6, color: "#555" }}>
-          Point it at a public or private GitHub repo, then ask questions about the actual code.
-        </p>
+      <header
+        style={{
+          marginBottom: 32,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          gap: 16,
+        }}
+      >
+        <div>
+          <h1 style={{ margin: 0, fontSize: 28 }}>
+            Velora <span style={{ color: ACCENT }}>Labs</span>
+          </h1>
+          <p style={{ marginTop: 6, color: "#555" }}>
+            Point it at a public or private GitHub repo, then ask questions about the actual code.
+          </p>
+        </div>
+
+        {authChecked && (
+          <div style={{ flexShrink: 0, textAlign: "right" }}>
+            {currentUser ? (
+              <>
+                <div style={{ fontSize: 13, color: "#555" }}>
+                  Signed in as <strong>{currentUser.github_login}</strong>
+                </div>
+                <button
+                  onClick={logOut}
+                  style={{
+                    marginTop: 4,
+                    padding: "4px 10px",
+                    fontSize: 12.5,
+                    background: "none",
+                    border: "1px solid #ccc",
+                    borderRadius: 6,
+                    cursor: "pointer",
+                  }}
+                >
+                  Log out
+                </button>
+              </>
+            ) : (
+              <a
+                href={`${API_BASE}/auth/github/login`}
+                style={{
+                  display: "inline-block",
+                  padding: "8px 14px",
+                  background: ACCENT,
+                  color: "white",
+                  borderRadius: 8,
+                  fontSize: 14,
+                  textDecoration: "none",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Log in with GitHub
+              </a>
+            )}
+          </div>
+        )}
       </header>
+
+      {authChecked && !currentUser && (
+        <p
+          style={{
+            marginBottom: 20,
+            padding: 12,
+            background: "#fff7ed",
+            border: "1px solid #fed7aa",
+            borderRadius: 8,
+            fontSize: 13.5,
+            color: "#9a3412",
+          }}
+        >
+          Log in with GitHub to index a repository — each indexed repo is private to your account.
+        </p>
+      )}
 
       <section
         style={{
@@ -283,14 +412,14 @@ export default function HomePage() {
           />
           <button
             onClick={ingestAndIndexRepo}
-            disabled={loadingRepo || !repoUrl.trim()}
+            disabled={loadingRepo || !repoUrl.trim() || !currentUser}
             style={{
               padding: "10px 16px",
-              background: !repoUrl.trim() ? "#9ca3af" : ACCENT,
+              background: !repoUrl.trim() || !currentUser ? "#9ca3af" : ACCENT,
               color: "white",
               borderRadius: 8,
               border: "none",
-              cursor: loadingRepo || !repoUrl.trim() ? "not-allowed" : "pointer",
+              cursor: loadingRepo || !repoUrl.trim() || !currentUser ? "not-allowed" : "pointer",
               fontSize: 14,
               whiteSpace: "nowrap",
             }}
