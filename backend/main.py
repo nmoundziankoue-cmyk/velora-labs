@@ -1,8 +1,10 @@
 import os
+import secrets
 import shutil
 import sys
 import threading
 import time
+import uuid
 from collections import defaultdict
 
 from dotenv import load_dotenv
@@ -26,12 +28,27 @@ if not os.environ.get("GEMINI_API_KEY", "").strip():
         "gratuite sur ai.google.dev et exporte-la avant de lancer le serveur."
     )
 
+# Idem pour l'OAuth GitHub (connexion) : sans ces deux valeurs, aucune
+# connexion n'est possible, donc autant échouer au démarrage plutôt qu'au
+# premier clic sur "Se connecter". Enregistrer une GitHub OAuth App sur
+# https://github.com/settings/developers pour les obtenir (étape manuelle,
+# voir README.md).
+for _var in ("GITHUB_OAUTH_CLIENT_ID", "GITHUB_OAUTH_CLIENT_SECRET"):
+    if not os.environ.get(_var, "").strip():
+        raise RuntimeError(
+            f"{_var} n'est pas définie ou est vide. Enregistre une GitHub OAuth "
+            f"App (https://github.com/settings/developers) et renseigne ses "
+            f"identifiants avant de lancer le serveur — voir README.md."
+        )
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, field_validator
+import auth
+import github_oauth
 from database import Base, SessionLocal, engine
-from models import Job, Repo
+from models import Job, Repo, User
 from ingest import ALLOWED_EXTENSIONS, clone_repository, get_code_files, index_repository, RepoCloneError
 from retrieval import retrieve_context, RetrievalError
 from llm import generate_answer, GenerationError
@@ -61,6 +78,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ===== OAUTH GITHUB =====
+# URL publique de CE backend, nécessaire pour construire le redirect_uri de
+# l'échange OAuth — doit correspondre EXACTEMENT à l'"Authorization callback
+# URL" enregistrée dans les paramètres de la GitHub OAuth App (GitHub refuse
+# l'échange sinon). Construit depuis un env var plutôt que depuis l'URL de
+# la requête entrante, pour ne pas dépendre d'un header Host potentiellement
+# falsifiable derrière un proxy.
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").strip().rstrip("/")
+GITHUB_OAUTH_REDIRECT_URI = f"{BACKEND_URL}/auth/github/callback"
+# Après connexion, où renvoyer l'utilisateur : le frontend en prod, sinon
+# localhost:3000 en dev — réutilise la même logique que le CORS ci-dessus.
+POST_LOGIN_REDIRECT_URL = _frontend_url or "http://localhost:3000"
 
 # ===== MODELS =====
 
@@ -223,18 +253,94 @@ def enforce_rate_limit(request: Request):
 def root():
     return {"status": "Velora running 🚀"}
 
-@app.post("/repo", status_code=202)
-def create_repo(req: RepoRequest, request: Request):
-    enforce_rate_limit(request)
+@app.get("/auth/github/login")
+def github_login():
+    state = secrets.token_urlsafe(16)
+    authorize_url = github_oauth.build_authorize_url(state, GITHUB_OAUTH_REDIRECT_URI)
+
+    response = RedirectResponse(authorize_url, status_code=302)
+    auth.set_oauth_state_cookie(response, state)
+    return response
+
+@app.get("/auth/github/callback")
+def github_callback(request: Request, code: str | None = None, state: str | None = None):
+    cookie_state = request.cookies.get(auth.OAUTH_STATE_COOKIE_NAME)
+    # Comparaison anti-CSRF : le state renvoyé par GitHub doit correspondre
+    # exactement à celui posé en cookie avant la redirection — sinon la
+    # requête ne vient pas du flux qu'on a initié nous-mêmes.
+    if not code or not state or not cookie_state or state != cookie_state:
+        raise HTTPException(status_code=400, detail="Invalid or missing OAuth state")
+
+    try:
+        access_token = github_oauth.exchange_code_for_token(code, GITHUB_OAUTH_REDIRECT_URI)
+        gh_user = github_oauth.fetch_github_user(access_token)
+    except github_oauth.GitHubOAuthError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    github_id = gh_user.get("id")
+    github_login = gh_user.get("login")
+    if not github_id or not github_login:
+        raise HTTPException(status_code=502, detail="GitHub did not return a usable profile")
 
     db = SessionLocal()
     try:
-        # owner_id=None : aucune authentification n'existe encore (Étape 3
-        # à venir). Le Repo et son Job doivent exister en base AVANT de
-        # renvoyer repo_id au client, sinon un polling très rapide pourrait
-        # taper GET .../status avant le commit — 404 alors que le job est
-        # bel et bien en file.
-        repo = Repo(repo_url=req.repo_url, owner_id=None)
+        user = db.query(User).filter(User.github_id == github_id).first()
+        if user is None:
+            user = User(github_id=github_id, github_login=github_login)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        elif user.github_login != github_login:
+            # Le login GitHub peut changer ; on le garde à jour pour
+            # l'affichage, mais l'identité réelle reste github_id (immuable).
+            user.github_login = github_login
+            db.commit()
+        raw_session_token = auth.create_session(db, user)
+    finally:
+        db.close()
+
+    response = RedirectResponse(POST_LOGIN_REDIRECT_URL, status_code=302)
+    auth.set_session_cookie(response, raw_session_token)
+    auth.clear_oauth_state_cookie(response)
+    return response
+
+@app.get("/auth/me")
+def auth_me(request: Request):
+    user = auth.get_current_user(request)
+    return {"id": user.id, "github_login": user.github_login}
+
+@app.post("/auth/logout")
+def logout(request: Request):
+    raw_session_token = request.cookies.get(auth.SESSION_COOKIE_NAME)
+    if raw_session_token:
+        auth.delete_session_by_token(raw_session_token)
+
+    response = JSONResponse({"status": "logged_out"})
+    auth.clear_session_cookie(response)
+    return response
+
+def _parse_repo_id(repo_id: str) -> str | None:
+    """Valide que repo_id est un UUID avant de l'utiliser dans une requête
+    Postgres — sans ça, une valeur malformée fait planter la colonne UUID
+    en 500 (DataError) plutôt qu'un 404 propre. Renvoie la forme canonique
+    (str) ou None si invalide."""
+    try:
+        return str(uuid.UUID(repo_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+@app.post("/repo", status_code=202)
+def create_repo(req: RepoRequest, request: Request):
+    enforce_rate_limit(request)
+    current_user = auth.get_current_user(request)
+
+    db = SessionLocal()
+    try:
+        # Le Repo et son Job doivent exister en base AVANT de renvoyer
+        # repo_id au client, sinon un polling très rapide pourrait taper
+        # GET .../status avant le commit — 404 alors que le job est bel et
+        # bien en file.
+        repo = Repo(repo_url=req.repo_url, owner_id=current_user.id)
         db.add(repo)
         db.flush()
         job = Job(repo_id=repo.id, stage="queued")
@@ -254,14 +360,24 @@ def create_repo(req: RepoRequest, request: Request):
     return {"repo_id": repo_id, "status": "queued"}
 
 @app.get("/repo/{repo_id}/status")
-def repo_status(repo_id: str):
+def repo_status(repo_id: str, request: Request):
+    current_user = auth.get_current_user(request)
+
+    parsed_id = _parse_repo_id(repo_id)
+    if parsed_id is None:
+        return JSONResponse(status_code=404, content={"error": "repo not found"})
+
     db = SessionLocal()
     try:
-        job = db.query(Job).filter(Job.repo_id == repo_id).first()
+        repo = db.query(Repo).filter(Repo.id == parsed_id).first()
+        job = db.query(Job).filter(Job.repo_id == parsed_id).first() if repo else None
     finally:
         db.close()
 
-    if job is None:
+    # 404 (jamais 403) si le repo n'existe pas OU n'appartient pas à
+    # l'utilisateur courant : ne pas laisser deviner qu'un repo_id existe
+    # en révélant une différence de statut entre les deux cas.
+    if repo is None or repo.owner_id != current_user.id or job is None:
         return JSONResponse(status_code=404, content={"error": "repo not found"})
 
     return {
@@ -276,22 +392,33 @@ def repo_status(repo_id: str):
 @app.post("/ask")
 def ask(req: AskRequest, request: Request):
     enforce_rate_limit(request)
+    current_user = auth.get_current_user(request)
+
+    parsed_id = _parse_repo_id(req.repo_id)
+    if parsed_id is None:
+        return JSONResponse(status_code=404, content={"error": "repo not found"})
 
     db = SessionLocal()
     try:
-        job = db.query(Job).filter(Job.repo_id == req.repo_id).first()
+        repo = db.query(Repo).filter(Repo.id == parsed_id).first()
+        job = db.query(Job).filter(Job.repo_id == parsed_id).first() if repo else None
     finally:
         db.close()
 
-    # On exige stage == "ready", pas seulement l'existence du Repo : le Repo
-    # est créé dès la mise en file (avant même le clone), donc sans ce
-    # contrôle un repo encore en cours d'indexation ou en échec renverrait
-    # une réponse dégradée (0 chunk trouvé) au lieu d'un 404 clair.
-    if job is None or job.stage != "ready":
+    # On exige la propriété ET stage == "ready", pas seulement l'existence
+    # du Repo : le Repo est créé dès la mise en file (avant même le clone),
+    # donc sans ce contrôle un repo encore en cours d'indexation, en échec,
+    # ou appartenant à quelqu'un d'autre renverrait soit une réponse
+    # dégradée (0 chunk trouvé), soit une fuite de contenu entre comptes.
+    if repo is None or repo.owner_id != current_user.id or job is None or job.stage != "ready":
         return JSONResponse(status_code=404, content={"error": "repo not found"})
 
     try:
-        context, sources = retrieve_context(req.question, repo_id=req.repo_id)
+        # parsed_id (forme canonique), pas req.repo_id brut : Chroma a été
+        # rempli avec la forme canonique venant de Postgres (repo.id), donc
+        # une casse différente mais équivalente dans la requête client ne
+        # doit pas faire manquer les chunks.
+        context, sources = retrieve_context(req.question, repo_id=parsed_id)
         answer = generate_answer(req.question, context)
     except (RetrievalError, GenerationError) as e:
         return JSONResponse(

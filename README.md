@@ -4,7 +4,7 @@ Assistant IA qui indexe un dépôt GitHub (embeddings + ChromaDB) et répond à 
 
 ## Stack
 
-- **Backend** : FastAPI, Postgres (métadonnées : repos, jobs d'indexation) via SQLAlchemy, ChromaDB (vector store), Google Gemini (`gemini-embedding-001` pour les embeddings, `gemini-flash-latest` pour le chat).
+- **Backend** : FastAPI, Postgres (utilisateurs, repos, jobs d'indexation, sessions) via SQLAlchemy, OAuth GitHub (connexion) via `urllib` stdlib, ChromaDB (vector store), Google Gemini (`gemini-embedding-001` pour les embeddings, `gemini-flash-latest` pour le chat).
 - **Frontend** : Next.js (App Router).
 
 ## ⚠️ Persistance partielle entre redeploys
@@ -23,10 +23,12 @@ brew install postgresql@16
 createdb velora_dev
 
 cd backend
-cp .env.example .env   # GEMINI_API_KEY + DATABASE_URL=postgresql://localhost/velora_dev
+cp .env.example .env   # GEMINI_API_KEY, DATABASE_URL, GITHUB_OAUTH_CLIENT_ID/SECRET (voir plus bas)
 pip install -r requirements.txt
 uvicorn main:app --reload   # crée les tables au démarrage si elles n'existent pas
 ```
+
+**Connexion GitHub en local** : crée une GitHub OAuth App sur [github.com/settings/developers](https://github.com/settings/developers) avec comme "Authorization callback URL" `http://localhost:8000/auth/github/callback`, puis renseigne `GITHUB_OAUTH_CLIENT_ID`/`GITHUB_OAUTH_CLIENT_SECRET` dans `.env`. Sans ça, le serveur refuse de démarrer (même échec-rapide que pour `GEMINI_API_KEY`/`DATABASE_URL`).
 
 ### Frontend
 
@@ -43,7 +45,9 @@ npm run dev
 |---|---|---|
 | `GEMINI_API_KEY` | backend | Clé API Gemini (obligatoire, le serveur refuse de démarrer sans). |
 | `DATABASE_URL` | backend | URL de connexion Postgres (obligatoire, le serveur refuse de démarrer sans). Injectée automatiquement en prod par Render (voir render.yaml). |
-| `FRONTEND_URL` | backend | URL du frontend en prod, pour CORS (optionnel — `localhost:3000` toujours autorisé). |
+| `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` | backend | Identifiants de la GitHub OAuth App pour la connexion (obligatoires, le serveur refuse de démarrer sans). À créer sur github.com/settings/developers. |
+| `BACKEND_URL` | backend | URL publique de ce backend, pour construire l'URL de callback OAuth (optionnel en dev — fallback `http://localhost:8000`). |
+| `FRONTEND_URL` | backend | URL du frontend en prod, pour CORS et redirection post-connexion (optionnel — `localhost:3000` toujours autorisé). |
 | `NEXT_PUBLIC_API_BASE` | frontend | URL du backend (optionnel en dev — fallback `localhost:8000`). |
 
 ## Déploiement
@@ -58,3 +62,12 @@ npm run dev
 1. Vérifier sur le dashboard Render que le plan Postgres `free` est toujours proposé pour une nouvelle base au moment du déploiement (l'offre gratuite a changé plusieurs fois par le passé) — ajuster `plan:` dans `render.yaml` sinon.
 2. Si le service backend existe déjà sur Render (déployé avant l'ajout de ce `render.yaml`), un `git push` seul ne suffit pas forcément : ouvrir le dashboard Render et lancer une synchronisation du Blueprint pour qu'il crée la base `velora-db` et relie `DATABASE_URL` au service existant.
 3. Confirmer dans l'onglet "Environment" du service backend que `DATABASE_URL` est bien renseignée après la synchronisation (elle doit apparaître comme liée à `velora-db`, pas comme une valeur à saisir à la main).
+
+### Étapes manuelles GitHub OAuth App (connexion)
+
+Impossible à automatiser depuis ce dépôt — nécessite un compte GitHub avec accès au dashboard :
+
+1. Créer une OAuth App sur [github.com/settings/developers](https://github.com/settings/developers) → "New OAuth App".
+2. Homepage URL : l'URL Vercel du frontend en prod. Authorization callback URL : `<BACKEND_URL>/auth/github/callback` — doit correspondre **exactement** à la valeur de `BACKEND_URL` définie sur Render (GitHub rejette l'échange sinon, même une différence de trailing slash).
+3. Copier le "Client ID" et générer un "Client secret", puis les renseigner dans les variables d'environnement `GITHUB_OAUTH_CLIENT_ID`/`GITHUB_OAUTH_CLIENT_SECRET` du service backend sur Render.
+4. Définir aussi `BACKEND_URL` sur Render avec l'URL publique réelle du service (ex: `https://velora-backend.onrender.com`) — sans ça, l'URL de callback construite pointera vers `localhost` et l'échange OAuth échouera en prod.

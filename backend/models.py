@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,16 +17,20 @@ def _utcnow() -> datetime:
 
 
 class User(Base):
-    """Minimal à dessein : l'Étape 3 (auth) ajoutera les colonnes propres à
-    la méthode d'authentification retenue (ex: github_id, email) — pas de
-    colonne spéculative ici."""
+    """github_id/github_login ajoutés maintenant que la méthode d'auth est
+    tranchée (OAuth GitHub). github_login est purement informatif (affichage
+    "connecté en tant que X") — toute la logique d'autorisation repose sur
+    `id`/`github_id`, jamais sur le login (qui peut changer)."""
 
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True, default=_new_uuid)
+    github_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    github_login: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     repos: Mapped[list["Repo"]] = relationship(back_populates="owner")
+    sessions: Mapped[list["UserSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class Repo(Base):
@@ -35,15 +39,16 @@ class Repo(Base):
     # Cet id EST le repo_id utilisé partout ailleurs (API, Chroma metadata,
     # nom de répertoire de clone) — pas une clé technique séparée.
     id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True, default=_new_uuid)
-    # Nullable pour l'instant : aucune authentification n'existe encore
-    # (Étape 3). Deviendra obligatoire une fois l'auth en place.
-    owner_id: Mapped[str | None] = mapped_column(
-        PG_UUID(as_uuid=False), ForeignKey("users.id"), nullable=True
+    # Obligatoire depuis l'Étape 3 : POST /repo exige désormais un
+    # utilisateur authentifié. (Était nullable le temps que l'auth n'existe
+    # pas encore — plus de raison de l'être maintenant.)
+    owner_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=False), ForeignKey("users.id"), nullable=False
     )
     repo_url: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
-    owner: Mapped["User | None"] = relationship(back_populates="repos")
+    owner: Mapped["User"] = relationship(back_populates="repos")
     job: Mapped["Job"] = relationship(back_populates="repo", uselist=False, cascade="all, delete-orphan")
 
 
@@ -69,3 +74,20 @@ class Job(Base):
     )
 
     repo: Mapped["Repo"] = relationship(back_populates="job")
+
+
+class UserSession(Base):
+    """Session de connexion opaque (cookie httponly), pas un JWT — évite
+    d'ajouter une lib de signature de token. Seul `token_hash` (SHA-256 du
+    jeton réel envoyé au navigateur) est stocké : une fuite de la table
+    `sessions` ne suffit pas à réutiliser une session existante."""
+
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True, default=_new_uuid)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="sessions")

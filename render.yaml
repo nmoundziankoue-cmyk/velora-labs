@@ -24,3 +24,9 @@ services:
         fromDatabase:
           name: velora-db
           property: connectionString
+      - key: GITHUB_OAUTH_CLIENT_ID
+        sync: false
+      - key: GITHUB_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: BACKEND_URL
+        sync: false
