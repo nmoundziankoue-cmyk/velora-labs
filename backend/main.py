@@ -2,7 +2,9 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
+import uuid
 from collections import defaultdict
 
 from dotenv import load_dotenv
@@ -58,12 +60,32 @@ app.add_middleware(
 
 class RepoRequest(BaseModel):
     repo_url: str
+    # Personal Access Token GitHub, scope lecture seule, pour les dépôts
+    # privés (v1 — voir POLICY.md). Jamais persisté : ni dans repos_state.json,
+    # ni loggé. N'existe qu'en mémoire le temps de cette requête.
+    access_token: str | None = None
 
     @field_validator("repo_url")
     @classmethod
     def repo_url_not_blank(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("repo_url must not be empty")
+        return v
+
+    @field_validator("access_token")
+    @classmethod
+    def access_token_stripped_or_none(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        # Garde-fou minimal, pas une validation de format (les formats de
+        # token GitHub évoluent) : un espace/saut de ligne interne trahit
+        # presque toujours une erreur de copier-coller (texte en trop, deux
+        # tokens collés), pas un token valide.
+        if any(c.isspace() for c in v):
+            raise ValueError("access_token must not contain spaces or newlines")
         return v
 
 class AskRequest(BaseModel):
@@ -92,6 +114,89 @@ def save_repos_state():
 
 repos = load_repos_state()
 
+# ===== INDEXATION ASYNCHRONE =====
+# `index_repository()` peut faire des milliers d'appels Gemini séquentiels
+# sur un gros repo (plusieurs minutes) — inacceptable dans le cycle d'une
+# requête HTTP. On la lance dans un thread d'arrière-plan et le frontend
+# suit la progression réelle via GET /repo/{repo_id}/status (polling).
+#
+# Volontairement pas de vraie queue (Celery/RQ + Redis) à ce stade : le
+# projet tourne en un seul process, sans dépendance externe, et Render en
+# plan gratuit ne supporte pas facilement un service worker séparé + Redis
+# managé. Un thread + un dict en mémoire réglent le problème réel (timeout
+# HTTP, progression trompeuse) sans ajouter d'infra — migrable plus tard si
+# le volume le justifie. Limite acceptée : ne survit pas à un redémarrage du
+# process, ne scale pas à plusieurs workers — déjà vrai de `repos` aujourd'hui.
+_index_jobs = {}
+
+def _run_indexing_job(repo_id: str, repo_url: str, access_token: str | None):
+    _index_jobs[repo_id]["stage"] = "cloning"
+
+    try:
+        repo_path = clone_repository(repo_url, repo_id, access_token=access_token)
+    except RepoCloneError as e:
+        _index_jobs[repo_id]["stage"] = "error"
+        _index_jobs[repo_id]["error"] = str(e)
+        return
+    finally:
+        # Le token n'a plus d'utilité passé cet appel, qu'il ait réussi ou
+        # échoué — jeté immédiatement, pas seulement en fin de job (voir
+        # POLICY.md).
+        access_token = None
+
+    try:
+        _index_jobs[repo_id]["stage"] = "reading_files"
+        files = get_code_files(repo_path)
+        _index_jobs[repo_id]["files_found"] = len(files)
+
+        if len(files) > MAX_FILES_PER_REPO:
+            _index_jobs[repo_id]["stage"] = "error"
+            _index_jobs[repo_id]["error"] = (
+                f"Repo too large ({len(files)} files, max {MAX_FILES_PER_REPO} "
+                f"for this demo). Try a smaller repo."
+            )
+            return
+
+        if len(files) == 0:
+            extensions = ", ".join(sorted(ALLOWED_EXTENSIONS))
+            _index_jobs[repo_id]["stage"] = "error"
+            _index_jobs[repo_id]["error"] = (
+                f"No supported source files found in this repository. "
+                f"Supported extensions: {extensions}."
+            )
+            return
+
+        _index_jobs[repo_id]["stage"] = "indexing"
+
+        def on_progress(indexed_files, total_chunks, files_total):
+            _index_jobs[repo_id]["indexed_files"] = indexed_files
+            _index_jobs[repo_id]["total_chunks"] = total_chunks
+
+        index_result = index_repository(repo_id, repo_path, on_progress=on_progress)
+
+        if index_result["total_chunks"] == 0:
+            _index_jobs[repo_id]["stage"] = "error"
+            _index_jobs[repo_id]["error"] = (
+                "Indexing failed for every file (likely a temporary Gemini "
+                "API issue). Try again in a moment."
+            )
+            return
+
+        repos[repo_id] = {
+            "repo_url": repo_url,
+            "files": files,
+            "indexed": True,
+        }
+        save_repos_state()
+
+        _index_jobs[repo_id]["indexed_files"] = index_result["indexed_files"]
+        _index_jobs[repo_id]["total_chunks"] = index_result["total_chunks"]
+        _index_jobs[repo_id]["stage"] = "ready"
+    finally:
+        # Politique de rétention (POLICY.md) : purge garantie, succès ou
+        # échec — même principe qu'avant le passage en asynchrone.
+        shutil.rmtree(repo_path, ignore_errors=True)
+
 # ===== PROTECTION D'USAGE PUBLIC =====
 # Démo publique = pas d'auth. Deux garde-fous simples pour éviter qu'un pic
 # de trafic ne clone un repo énorme ou n'épuise le quota Gemini gratuit.
@@ -119,64 +224,46 @@ def enforce_rate_limit(request: Request):
 def root():
     return {"status": "Velora running 🚀"}
 
-@app.post("/repo")
+@app.post("/repo", status_code=202)
 def create_repo(req: RepoRequest, request: Request):
     enforce_rate_limit(request)
 
-    try:
-        repo_id, repo_path = clone_repository(req.repo_url)
-    except RepoCloneError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-    files = get_code_files(repo_path)
-
-    if len(files) > MAX_FILES_PER_REPO:
-        shutil.rmtree(repo_path, ignore_errors=True)
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": f"Repo too large ({len(files)} files, max {MAX_FILES_PER_REPO} "
-                f"for this demo). Try a smaller repo."
-            },
-        )
-
-    if len(files) == 0:
-        shutil.rmtree(repo_path, ignore_errors=True)
-        extensions = ", ".join(sorted(ALLOWED_EXTENSIONS))
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": f"No supported source files found in this repository. "
-                f"Supported extensions: {extensions}."
-            },
-        )
-
-    index_result = index_repository(repo_id, repo_path)
-
-    if index_result["total_chunks"] == 0:
-        shutil.rmtree(repo_path, ignore_errors=True)
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": "Indexing failed for every file (likely a temporary Gemini "
-                "API issue). Try again in a moment."
-            },
-        )
-
-    repos[repo_id] = {
-        "repo_url": req.repo_url,
-        "repo_path": repo_path,
-        "files": files,
-        "indexed": True
+    repo_id = str(uuid.uuid4())
+    # Le job doit exister dans _index_jobs AVANT de renvoyer repo_id au
+    # client, sinon un polling très rapide pourrait taper GET .../status
+    # avant que le thread n'ait eu le temps de s'enregistrer lui-même — 404
+    # alors que le job est bel et bien en file. On l'initialise donc ici,
+    # de façon synchrone, pas dans _run_indexing_job.
+    _index_jobs[repo_id] = {
+        "stage": "queued",
+        "files_found": None,
+        "indexed_files": 0,
+        "total_chunks": 0,
+        "error": None,
     }
-    save_repos_state()
+
+    thread = threading.Thread(
+        target=_run_indexing_job,
+        args=(repo_id, req.repo_url, req.access_token),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"repo_id": repo_id, "status": "queued"}
+
+@app.get("/repo/{repo_id}/status")
+def repo_status(repo_id: str):
+    job = _index_jobs.get(repo_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "repo not found"})
 
     return {
         "repo_id": repo_id,
-        "files_found": len(files),
-        "indexed_files": index_result["indexed_files"],
-        "total_chunks": index_result["total_chunks"],
-        "status": "ready"
+        "stage": job["stage"],
+        "files_found": job["files_found"],
+        "indexed_files": job["indexed_files"],
+        "total_chunks": job["total_chunks"],
+        "error": job["error"],
     }
 
 @app.post("/ask")

@@ -1,7 +1,7 @@
+import base64
 import os
 import shutil
 import sys
-import uuid
 import subprocess
 
 # Défense en profondeur si ce module tourne hors du process main.py
@@ -51,15 +51,25 @@ class RepoCloneError(Exception):
     """Levée quand `git clone` échoue (URL invalide, repo privé/inexistant, timeout)."""
 
 
-def clone_repository(repo_url: str):
+def clone_repository(repo_url: str, repo_id: str, access_token: str = None):
     os.makedirs(REPOS_DIR, exist_ok=True)
 
-    repo_id = str(uuid.uuid4())
     repo_path = os.path.join(REPOS_DIR, repo_id)
+
+    cmd = ["git", "clone", "--depth", "1"]
+    if access_token:
+        # Le token passe en en-tête HTTP git (`-c http.extraHeader=...`),
+        # jamais dans l'URL clonée : une URL avec token intégré peut se
+        # retrouver telle quelle dans un message d'erreur git (stderr) que
+        # quelqu'un serait tenté de logger un jour. Cet en-tête reste local
+        # à cet appel `git` uniquement.
+        auth_header = base64.b64encode(f"x-access-token:{access_token}".encode()).decode()
+        cmd += ["-c", f"http.extraHeader=Authorization: Basic {auth_header}"]
+    cmd += [repo_url, repo_path]
 
     try:
         subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, repo_path],
+            cmd,
             check=True,
             capture_output=True,
             text=True,
@@ -67,18 +77,26 @@ def clone_repository(repo_url: str):
         )
     except subprocess.TimeoutExpired:
         shutil.rmtree(repo_path, ignore_errors=True)
+        # `from None` : TimeoutExpired.cmd contiendrait le token (argv complet).
+        # On casse le chaînage pour qu'il ne puisse jamais apparaître dans un
+        # traceback, même indirectement (ex: un futur handler d'erreur qui
+        # loggerait __cause__/__context__).
         raise RepoCloneError(
             "Le clone du repository a dépassé le délai autorisé. "
             "Vérifie l'URL ou réessaie plus tard."
-        )
-    except subprocess.CalledProcessError as e:
+        ) from None
+    except subprocess.CalledProcessError:
         shutil.rmtree(repo_path, ignore_errors=True)
+        # Idem : CalledProcessError.cmd contiendrait le token. On ne relaie
+        # ni `from e`, ni `e.stderr`/`e.stdout` (git peut échoer l'URL ou
+        # l'en-tête dans son propre message d'erreur).
         raise RepoCloneError(
-            "Impossible de cloner le repository. Vérifie que l'URL est "
-            "correcte et que le repo est public."
-        ) from e
+            "Impossible de cloner le repository. Vérifie que l'URL est correcte, "
+            "que le repo existe, et — s'il est privé — que le token fourni a bien "
+            "un accès en lecture."
+        ) from None
 
-    return repo_id, repo_path
+    return repo_path
 
 
 def get_code_files(repo_path: str):
@@ -110,19 +128,53 @@ def get_code_files(repo_path: str):
     return code_files
 
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE):
-    chunks = []
-    start = 0
+def chunk_lines(text: str, chunk_size: int = CHUNK_SIZE):
+    """Découpe `text` en chunks alignés sur des frontières de ligne.
 
-    while start < len(text):
-        chunk = text[start:start + chunk_size]
-        chunks.append(chunk)
-        start += chunk_size
+    Accumule des lignes consécutives jusqu'à atteindre ~chunk_size
+    caractères puis referme le chunk — jamais au milieu d'une ligne, pour
+    qu'une citation `line_start`/`line_end` pointe toujours vers des lignes
+    entières et exactes du fichier original. Une ligne isolée plus longue
+    que chunk_size forme son propre chunk plutôt que d'être tronquée.
+    """
+    lines = text.splitlines()
+    chunks = []
+    current_lines = []
+    current_len = 0
+    start_line = 1
+
+    for i, line in enumerate(lines, start=1):
+        line_len = len(line) + 1  # +1 pour le saut de ligne implicite
+
+        if current_lines and current_len + line_len > chunk_size:
+            chunks.append({
+                "text": "\n".join(current_lines),
+                "line_start": start_line,
+                "line_end": i - 1,
+            })
+            current_lines = []
+            current_len = 0
+            start_line = i
+
+        current_lines.append(line)
+        current_len += line_len
+
+    if current_lines:
+        chunks.append({
+            "text": "\n".join(current_lines),
+            "line_start": start_line,
+            "line_end": start_line + len(current_lines) - 1,
+        })
 
     return chunks
 
 
-def index_repository(repo_id: str, repo_path: str):
+def index_repository(repo_id: str, repo_path: str, on_progress=None):
+    """`on_progress`, si fourni, est appelé après chaque fichier traité avec
+    (indexed_files, total_chunks, files_total) — c'est le signal de
+    progression réelle utilisé par l'endpoint de statut asynchrone
+    (voir main.py, _run_indexing_job), à la place d'un minuteur cosmétique.
+    """
     files = get_code_files(repo_path)
     indexed_files = 0
     total_chunks = 0
@@ -135,20 +187,22 @@ def index_repository(repo_id: str, repo_path: str):
             if not content.strip():
                 continue
 
-            chunks = chunk_text(content)
+            chunks = chunk_lines(content)
             relative_path = os.path.relpath(path, repo_path)
 
             for i, chunk in enumerate(chunks):
-                embedding = embed_text(chunk)
+                embedding = embed_text(chunk["text"])
 
                 add_chunk(
                     chunk_id=f"{repo_id}:{relative_path}:{i}",
-                    text=chunk,
+                    text=chunk["text"],
                     embedding=embedding,
                     metadata={
                         "repo_id": repo_id,
                         "path": relative_path,
                         "chunk_index": i,
+                        "line_start": chunk["line_start"],
+                        "line_end": chunk["line_end"],
                     },
                 )
 
@@ -158,6 +212,9 @@ def index_repository(repo_id: str, repo_path: str):
 
         except Exception as e:
             print(f"Error indexing {path}: {e}", flush=True)
+
+        if on_progress:
+            on_progress(indexed_files, total_chunks, len(files))
 
     return {
         "indexed_files": indexed_files,

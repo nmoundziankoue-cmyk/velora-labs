@@ -23,14 +23,18 @@ def retrieve_context(question: str, repo_id: str = None):
     for doc, meta in results:
         path = meta.get("path", "unknown")
         chunk_index = meta.get("chunk_index", 0)
+        line_start = meta.get("line_start")
+        line_end = meta.get("line_end")
 
         context_parts.append(
-            f"FILE: {path}\nCHUNK: {chunk_index}\nCONTENT:\n{doc}"
+            f"FILE: {path}\nLINES: {line_start}-{line_end}\nCONTENT:\n{doc}"
         )
 
         sources.append({
             "path": path,
-            "chunk_index": chunk_index
+            "chunk_index": chunk_index,
+            "line_start": line_start,
+            "line_end": line_end,
         })
 
     # 4. Fusion contexte
