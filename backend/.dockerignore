@@ -3,4 +3,3 @@ chroma_data/
 __pycache__/
 *.pyc
 .env
-repos_state.json

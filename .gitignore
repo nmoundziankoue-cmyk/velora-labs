@@ -1,6 +1,5 @@
 backend/repos/
 backend/chroma_data/
-backend/repos_state.json
 __pycache__/
 .venv/
 .env

@@ -1,3 +1,13 @@
+# NOTE : le plan Postgres ci-dessous ("free") est un point de départ, pas
+# une certitude — vérifie sur ton dashboard Render que ce plan est encore
+# disponible pour une nouvelle base au moment où tu déploies (l'offre gratuite
+# Postgres de Render a changé plusieurs fois dans le passé). Voir le message
+# de fin d'étape pour la liste complète des actions manuelles nécessaires.
+databases:
+  - name: velora-db
+    plan: free
+    postgresMajorVersion: "16"
+
 services:
   - type: web
     name: velora-backend
@@ -10,3 +20,7 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: velora-db
+          property: connectionString
