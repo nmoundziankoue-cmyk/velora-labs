@@ -2,6 +2,8 @@
 
 Assistant IA qui indexe un dépôt GitHub (embeddings + ChromaDB) et répond à des questions sur son code via Gemini (RAG).
 
+**Nouveau sur Velora ?** Ce README documente le projet pour qui le développe/déploie. Pour l'utiliser (créer un token, indexer un premier repo, lire une réponse), voir [docs/getting-started.md](docs/getting-started.md).
+
 ## Stack
 
 - **Backend** : FastAPI, Postgres (utilisateurs, repos, jobs d'indexation, sessions) via SQLAlchemy, OAuth GitHub (connexion) via `urllib` stdlib, ChromaDB (vector store), Google Gemini (`gemini-embedding-001` pour les embeddings, `gemini-flash-latest` pour le chat).

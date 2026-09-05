@@ -7,7 +7,14 @@ type RepoQueuedResponse = {
   status: string;
 };
 
-type RepoStage = "queued" | "cloning" | "reading_files" | "indexing" | "ready" | "error";
+type RepoStage =
+  | "queued"
+  | "cloning"
+  | "reading_files"
+  | "indexing"
+  | "ready"
+  | "error"
+  | "quota_exceeded";
 
 type FailedFile = {
   path: string;
@@ -56,6 +63,7 @@ const STAGE_LABELS: Record<RepoStage, string> = {
   indexing: "Indexing files...",
   ready: "Ready.",
   error: "Error.",
+  quota_exceeded: "Quota reached.",
 };
 
 function formatSourceLocation(source: Source): string {
@@ -72,7 +80,13 @@ function formatSourceLocation(source: Source): string {
 }
 
 export default function HomePage() {
-  const [repoUrl, setRepoUrl] = useState("https://github.com/vercel/next.js");
+  // vercel/next.js (l'exemple précédent) dépasse le cap de 1000 fichiers —
+  // un nouvel utilisateur qui clique sans changer l'URL tombait en erreur
+  // dès sa première interaction. explosion/wasabi est petit (16 fichiers
+  // reconnus, vérifié via get_code_files), du vrai code de production (pas
+  // un repo jouet), et a été indexé de bout en bout sans aucun échec avant
+  // de devenir cet exemple par défaut.
+  const [repoUrl, setRepoUrl] = useState("https://github.com/explosion/wasabi");
   const [accessToken, setAccessToken] = useState("");
   const [repoId, setRepoId] = useState("");
   const [pollingRepoId, setPollingRepoId] = useState<string | null>(null);
@@ -80,6 +94,7 @@ export default function HomePage() {
   const [status, setStatus] = useState("Idle");
   const [filesFound, setFilesFound] = useState<number | null>(null);
   const [failedFiles, setFailedFiles] = useState<FailedFile[]>([]);
+  const [quotaExceeded, setQuotaExceeded] = useState(false);
   const [answer, setAnswer] = useState("");
   const [answerError, setAnswerError] = useState(false);
   const [sources, setSources] = useState<Source[]>([]);
@@ -165,6 +180,23 @@ export default function HomePage() {
         return;
       }
 
+      if (data.stage === "quota_exceeded") {
+        // Distinct de "error" à dessein : ce n'est pas un fichier qui a un
+        // problème, c'est le quota Gemini du compte — et le repo reste
+        // utilisable pour ce qui a déjà été indexé, donc repoId est bien
+        // renseigné ici (contrairement à "error").
+        setRepoId(data.repo_id);
+        setFilesFound(data.files_found);
+        setQuotaExceeded(true);
+        setStatus(
+          data.error ??
+            `Gemini quota reached after ${data.indexed_files}/${data.files_found} files.`
+        );
+        setLoadingRepo(false);
+        setPollingRepoId(null);
+        return;
+      }
+
       if (data.stage === "ready") {
         setRepoId(data.repo_id);
         setFilesFound(data.files_found);
@@ -221,6 +253,7 @@ export default function HomePage() {
       setAnswerError(false);
       setSources([]);
       setFailedFiles([]);
+      setQuotaExceeded(false);
 
       const repoRes = await fetch(`${API_BASE}/repo`, {
         method: "POST",
@@ -496,6 +529,27 @@ export default function HomePage() {
             <div>
               <strong>Files found:</strong> {filesFound ?? 0}
             </div>
+          </div>
+        )}
+
+        {quotaExceeded && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: 12,
+              background: "#eff6ff",
+              border: "1px solid #bfdbfe",
+              borderRadius: 8,
+              fontSize: 13,
+              color: "#1e40af",
+            }}
+          >
+            <strong>Indexing stopped early — Gemini API quota reached</strong>
+            <p style={{ marginTop: 4, marginBottom: 0 }}>
+              This isn&apos;t a problem with any specific file. What&apos;s already indexed
+              (see below) is fully usable — ask a question about it now. Re-index later, or
+              wait a few minutes, to pick up the rest of the repo.
+            </p>
           </div>
         )}
 
