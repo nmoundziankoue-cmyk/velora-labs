@@ -9,12 +9,18 @@ type RepoQueuedResponse = {
 
 type RepoStage = "queued" | "cloning" | "reading_files" | "indexing" | "ready" | "error";
 
+type FailedFile = {
+  path: string;
+  reason: string;
+};
+
 type RepoStatusResponse = {
   repo_id: string;
   stage: RepoStage;
   files_found: number | null;
   indexed_files: number;
   total_chunks: number;
+  failed_files: FailedFile[];
   error: string | null;
 };
 
@@ -73,6 +79,7 @@ export default function HomePage() {
   const [question, setQuestion] = useState("");
   const [status, setStatus] = useState("Idle");
   const [filesFound, setFilesFound] = useState<number | null>(null);
+  const [failedFiles, setFailedFiles] = useState<FailedFile[]>([]);
   const [answer, setAnswer] = useState("");
   const [answerError, setAnswerError] = useState(false);
   const [sources, setSources] = useState<Source[]>([]);
@@ -146,6 +153,11 @@ export default function HomePage() {
         return;
       }
 
+      // Mis à jour à chaque poll, quel que soit le stage : les échecs
+      // (fichier trop gros, encodage invalide, erreur Gemini persistante)
+      // peuvent apparaître avant que l'indexation soit terminée.
+      setFailedFiles(data.failed_files ?? []);
+
       if (data.stage === "error") {
         setStatus(data.error ?? "Indexing failed. Please try again.");
         setLoadingRepo(false);
@@ -208,6 +220,7 @@ export default function HomePage() {
       setAnswer("");
       setAnswerError(false);
       setSources([]);
+      setFailedFiles([]);
 
       const repoRes = await fetch(`${API_BASE}/repo`, {
         method: "POST",
@@ -485,6 +498,30 @@ export default function HomePage() {
             </div>
           </div>
         )}
+
+        {failedFiles.length > 0 && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: 12,
+              background: "#fffbeb",
+              border: "1px solid #fde68a",
+              borderRadius: 8,
+              fontSize: 13,
+            }}
+          >
+            <strong style={{ color: "#92400e" }}>
+              {failedFiles.length} file{failedFiles.length > 1 ? "s" : ""} could not be indexed
+            </strong>
+            <ul style={{ marginTop: 6, paddingLeft: 18, color: "#78350f" }}>
+              {failedFiles.map((f, i) => (
+                <li key={`${f.path}-${i}`}>
+                  <code>{f.path}</code> — {f.reason}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </section>
 
       <section
@@ -564,7 +601,11 @@ export default function HomePage() {
 
             {!answerError && sources.length > 0 && (
               <div style={{ marginTop: 14, borderTop: "1px solid #e5e5e5", paddingTop: 12 }}>
-                <strong style={{ fontSize: 13 }}>Sources</strong>
+                <strong style={{ fontSize: 13 }}>Verified sources</strong>
+                <p style={{ marginTop: 2, marginBottom: 0, fontSize: 12, color: "#888" }}>
+                  Exact file and line ranges the answer was retrieved from — the only part of
+                  this response guaranteed to be accurate.
+                </p>
                 <ul style={{ marginTop: 6, paddingLeft: 18, fontSize: 13, color: "#555" }}>
                   {sources.map((s, i) => (
                     <li key={`${s.path}-${s.chunk_index}-${i}`}>
