@@ -100,7 +100,12 @@ def clone_repository(repo_url: str, repo_id: str, access_token: str = None):
 
 
 def get_code_files(repo_path: str):
+    """Renvoie (code_files, skipped_files). skipped_files liste les fichiers
+    par ailleurs éligibles (bonne extension, pas dans un dossier exclu) mais
+    écartés pour dépassement de taille — visible par l'utilisateur final
+    (voir main.py) plutôt que silencieusement absent du compte final."""
     code_files = []
+    skipped_files = []
 
     for root, dirs, files in os.walk(repo_path):
         # Élague les dossiers exclus avant d'y descendre : plus rapide que
@@ -117,15 +122,23 @@ def get_code_files(repo_path: str):
                 continue
 
             path = os.path.join(root, file)
+            relative_path = os.path.relpath(path, repo_path)
             try:
-                if os.path.getsize(path) > MAX_FILE_SIZE_BYTES:
-                    continue
+                size = os.path.getsize(path)
             except OSError:
+                continue
+
+            if size > MAX_FILE_SIZE_BYTES:
+                skipped_files.append({
+                    "path": relative_path,
+                    "reason": f"File too large ({size // 1024} KB, max "
+                    f"{MAX_FILE_SIZE_BYTES // 1024} KB)",
+                })
                 continue
 
             code_files.append(path)
 
-    return code_files
+    return code_files, skipped_files
 
 
 def chunk_lines(text: str, chunk_size: int = CHUNK_SIZE):
@@ -169,26 +182,46 @@ def chunk_lines(text: str, chunk_size: int = CHUNK_SIZE):
     return chunks
 
 
-def index_repository(repo_id: str, repo_path: str, owner_id: str, on_progress=None):
-    """`on_progress`, si fourni, est appelé après chaque fichier traité avec
-    (indexed_files, total_chunks, files_total) — c'est le signal de
-    progression réelle utilisé par l'endpoint de statut asynchrone
-    (voir main.py, _run_indexing_job), à la place d'un minuteur cosmétique.
+def index_repository(repo_id: str, repo_path: str, owner_id: str, files: list,
+                      known_failures: list = None, on_progress=None):
+    """`files` vient de get_code_files() — passé en paramètre plutôt que
+    recalculé ici pour éviter un second parcours disque redondant, et pour
+    que `known_failures` (fichiers déjà écartés pour taille, voir
+    get_code_files) et les échecs rencontrés ici partagent une seule liste
+    cohérente.
+
+    `on_progress`, si fourni, est appelé après chaque fichier traité avec
+    (indexed_files, total_chunks, files_total, failed_files) — c'est le
+    signal de progression réelle utilisé par l'endpoint de statut
+    asynchrone (voir main.py, _run_indexing_job), à la place d'un minuteur
+    cosmétique. `failed_files` grandit au fil de l'indexation : chaque
+    échec (fichier trop volumineux, encodage invalide, erreur Gemini
+    persistante, etc.) y apparaît avec son chemin et sa raison — plus
+    aucun échec n'est absorbé silencieusement dans un simple print().
     """
-    files = get_code_files(repo_path)
     indexed_files = 0
     total_chunks = 0
+    failed_files = list(known_failures or [])
+
+    if on_progress and failed_files:
+        on_progress(indexed_files, total_chunks, len(files), failed_files)
 
     for path in files:
+        relative_path = os.path.relpath(path, repo_path)
+
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            # Pas de errors="ignore" : un fichier qui n'est pas du texte
+            # UTF-8 valide (binaire mal détecté par son extension, encodage
+            # exotique) doit être signalé, pas silencieusement lu en
+            # remplaçant les octets invalides — ce qui aurait indexé du
+            # contenu corrompu sans que personne ne le sache.
+            with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
 
             if not content.strip():
                 continue
 
             chunks = chunk_lines(content)
-            relative_path = os.path.relpath(path, repo_path)
 
             for i, chunk in enumerate(chunks):
                 embedding = embed_text(chunk["text"])
@@ -211,13 +244,18 @@ def index_repository(repo_id: str, repo_path: str, owner_id: str, on_progress=No
 
             indexed_files += 1
 
+        except UnicodeDecodeError:
+            failed_files.append({"path": relative_path, "reason": "File is not valid UTF-8 text"})
+            print(f"Error indexing {path}: not valid UTF-8", flush=True)
         except Exception as e:
+            failed_files.append({"path": relative_path, "reason": str(e)})
             print(f"Error indexing {path}: {e}", flush=True)
 
         if on_progress:
-            on_progress(indexed_files, total_chunks, len(files))
+            on_progress(indexed_files, total_chunks, len(files), failed_files)
 
     return {
         "indexed_files": indexed_files,
         "total_chunks": total_chunks,
+        "failed_files": failed_files,
     }

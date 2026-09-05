@@ -49,7 +49,7 @@ import auth
 import github_oauth
 from database import Base, SessionLocal, engine
 from models import Job, Repo, User
-from ingest import ALLOWED_EXTENSIONS, clone_repository, get_code_files, index_repository, RepoCloneError
+from ingest import ALLOWED_EXTENSIONS, MAX_FILE_SIZE_BYTES, clone_repository, get_code_files, index_repository, RepoCloneError
 from retrieval import retrieve_context, RetrievalError
 from llm import generate_answer, GenerationError
 
@@ -175,8 +175,8 @@ def _run_indexing_job(repo_id: str, repo_url: str, owner_id: str, access_token: 
 
         try:
             set_job(stage="reading_files")
-            files = get_code_files(repo_path)
-            set_job(files_found=len(files))
+            files, skipped_files = get_code_files(repo_path)
+            set_job(files_found=len(files), failed_files=skipped_files)
 
             if len(files) > MAX_FILES_PER_REPO:
                 set_job(
@@ -187,24 +187,39 @@ def _run_indexing_job(repo_id: str, repo_url: str, owner_id: str, access_token: 
                 return
 
             if len(files) == 0:
-                extensions = ", ".join(sorted(ALLOWED_EXTENSIONS))
-                set_job(
-                    stage="error",
-                    error=f"No supported source files found in this repository. "
-                    f"Supported extensions: {extensions}.",
-                )
+                if skipped_files:
+                    # Distinguer ce cas de "aucun fichier reconnu" : la
+                    # cause réelle n'est pas l'absence de code, mais une
+                    # taille excessive — visible dans failed_files déjà,
+                    # mais le message d'erreur doit le dire clairement aussi.
+                    set_job(
+                        stage="error",
+                        error=f"All {len(skipped_files)} matching files were too large to "
+                        f"index (max {MAX_FILE_SIZE_BYTES // 1024} KB each). Try a smaller repo.",
+                    )
+                else:
+                    extensions = ", ".join(sorted(ALLOWED_EXTENSIONS))
+                    set_job(
+                        stage="error",
+                        error=f"No supported source files found in this repository. "
+                        f"Supported extensions: {extensions}.",
+                    )
                 return
 
             set_job(stage="indexing")
 
-            def on_progress(indexed_files, total_chunks, files_total):
-                set_job(indexed_files=indexed_files, total_chunks=total_chunks)
+            def on_progress(indexed_files, total_chunks, files_total, failed_files):
+                set_job(indexed_files=indexed_files, total_chunks=total_chunks, failed_files=failed_files)
 
-            index_result = index_repository(repo_id, repo_path, owner_id=owner_id, on_progress=on_progress)
+            index_result = index_repository(
+                repo_id, repo_path, owner_id=owner_id, files=files,
+                known_failures=skipped_files, on_progress=on_progress,
+            )
 
             if index_result["total_chunks"] == 0:
                 set_job(
                     stage="error",
+                    failed_files=index_result["failed_files"],
                     error="Indexing failed for every file (likely a temporary Gemini "
                     "API issue). Try again in a moment.",
                 )
@@ -213,6 +228,7 @@ def _run_indexing_job(repo_id: str, repo_url: str, owner_id: str, access_token: 
             set_job(
                 indexed_files=index_result["indexed_files"],
                 total_chunks=index_result["total_chunks"],
+                failed_files=index_result["failed_files"],
                 stage="ready",
             )
         finally:
@@ -386,6 +402,7 @@ def repo_status(repo_id: str, request: Request):
         "files_found": job.files_found,
         "indexed_files": job.indexed_files,
         "total_chunks": job.total_chunks,
+        "failed_files": job.failed_files,
         "error": job.error,
     }
 

@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -67,6 +67,10 @@ class Job(Base):
     files_found: Mapped[int | None] = mapped_column(Integer, nullable=True)
     indexed_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_chunks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Liste de {"path": ..., "reason": ...} — fichier trop volumineux,
+    # encodage invalide, échec Gemini persistant, etc. Beta prep : rendre
+    # visible ce qui échouait avant en silence (voir POLICY.md/README).
+    failed_files: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
