@@ -152,7 +152,7 @@ class AskRequest(BaseModel):
 # Session n'est pas thread-safe et ne doit jamais être partagée entre
 # threads — voir _run_indexing_job.
 
-def _run_indexing_job(repo_id: str, repo_url: str, access_token: str | None):
+def _run_indexing_job(repo_id: str, repo_url: str, owner_id: str, access_token: str | None):
     db = SessionLocal()
 
     def set_job(**fields):
@@ -200,7 +200,7 @@ def _run_indexing_job(repo_id: str, repo_url: str, access_token: str | None):
             def on_progress(indexed_files, total_chunks, files_total):
                 set_job(indexed_files=indexed_files, total_chunks=total_chunks)
 
-            index_result = index_repository(repo_id, repo_path, on_progress=on_progress)
+            index_result = index_repository(repo_id, repo_path, owner_id=owner_id, on_progress=on_progress)
 
             if index_result["total_chunks"] == 0:
                 set_job(
@@ -352,7 +352,7 @@ def create_repo(req: RepoRequest, request: Request):
 
     thread = threading.Thread(
         target=_run_indexing_job,
-        args=(repo_id, req.repo_url, req.access_token),
+        args=(repo_id, req.repo_url, current_user.id, req.access_token),
         daemon=True,
     )
     thread.start()
@@ -417,8 +417,11 @@ def ask(req: AskRequest, request: Request):
         # parsed_id (forme canonique), pas req.repo_id brut : Chroma a été
         # rempli avec la forme canonique venant de Postgres (repo.id), donc
         # une casse différente mais équivalente dans la requête client ne
-        # doit pas faire manquer les chunks.
-        context, sources = retrieve_context(req.question, repo_id=parsed_id)
+        # doit pas faire manquer les chunks. owner_id vient de la session
+        # authentifiée (current_user), jamais du corps de la requête client
+        # — un client ne peut pas usurper un autre owner_id en le passant
+        # lui-même.
+        context, sources = retrieve_context(req.question, owner_id=current_user.id, repo_id=parsed_id)
         answer = generate_answer(req.question, context)
     except (RetrievalError, GenerationError) as e:
         return JSONResponse(

@@ -6,13 +6,14 @@ class RetrievalError(Exception):
     """Levée quand l'embedding de la question ou la recherche vectorielle échoue."""
 
 
-def retrieve_context(question: str, repo_id: str = None):
+def retrieve_context(question: str, owner_id: str, repo_id: str):
     try:
         # 1. Embedding de la question
         query_embedding = embed_text(question)
 
-        # 2. Recherche dans la base vectorielle
-        results = search_chunks(query_embedding, repo_id=repo_id)
+        # 2. Recherche dans la base vectorielle — owner_id ET repo_id
+        # obligatoires (voir vector_store.search_chunks).
+        results = search_chunks(query_embedding, owner_id=owner_id, repo_id=repo_id)
     except Exception as e:
         raise RetrievalError(str(e)) from e
 

@@ -169,7 +169,7 @@ def chunk_lines(text: str, chunk_size: int = CHUNK_SIZE):
     return chunks
 
 
-def index_repository(repo_id: str, repo_path: str, on_progress=None):
+def index_repository(repo_id: str, repo_path: str, owner_id: str, on_progress=None):
     """`on_progress`, si fourni, est appelé après chaque fichier traité avec
     (indexed_files, total_chunks, files_total) — c'est le signal de
     progression réelle utilisé par l'endpoint de statut asynchrone
@@ -198,6 +198,7 @@ def index_repository(repo_id: str, repo_path: str, on_progress=None):
                     text=chunk["text"],
                     embedding=embedding,
                     metadata={
+                        "owner_id": owner_id,
                         "repo_id": repo_id,
                         "path": relative_path,
                         "chunk_index": i,
