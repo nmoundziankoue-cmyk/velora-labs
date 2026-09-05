@@ -32,6 +32,14 @@ class GenerationError(Exception):
 
 
 def generate_answer(question: str, context: str):
+    # Pas de section "Relevant files" dans ce prompt : le modèle produisait
+    # sa propre liste de fichiers en prose libre, non vérifiée, à côté des
+    # citations ligne par ligne réelles (`sources`, construites depuis les
+    # métadonnées Chroma dans retrieval.py) — deux listes qui se
+    # ressemblaient sans avoir la même fiabilité, ce qu'un utilisateur ne
+    # peut pas deviner tout seul. Les mentions de fichiers restent possibles
+    # dans le texte libre (Answer/Explanation), juste pas sous une forme qui
+    # imite une liste de citations.
     user_prompt = f"""
 Repository context:
 {context}
@@ -43,10 +51,6 @@ Please return:
 
 Answer:
 <your answer>
-
-Relevant files:
-- <path>
-- <path>
 
 Explanation:
 <short explanation>
