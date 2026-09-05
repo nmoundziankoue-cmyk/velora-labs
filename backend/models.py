@@ -62,7 +62,7 @@ class Job(Base):
     repo_id: Mapped[str] = mapped_column(
         PG_UUID(as_uuid=False), ForeignKey("repos.id"), nullable=False, unique=True
     )
-    # queued | cloning | reading_files | indexing | ready | error
+    # queued | cloning | reading_files | indexing | ready | error | quota_exceeded
     stage: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
     files_found: Mapped[int | None] = mapped_column(Integer, nullable=True)
     indexed_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

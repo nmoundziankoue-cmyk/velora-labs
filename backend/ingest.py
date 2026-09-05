@@ -10,7 +10,7 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
-from embeddings import embed_text
+from embeddings import embed_text, QuotaExceededError
 from vector_store import add_chunk
 
 REPOS_DIR = "repos"
@@ -202,6 +202,7 @@ def index_repository(repo_id: str, repo_path: str, owner_id: str, files: list,
     indexed_files = 0
     total_chunks = 0
     failed_files = list(known_failures or [])
+    quota_exceeded = False
 
     if on_progress and failed_files:
         on_progress(indexed_files, total_chunks, len(files), failed_files)
@@ -244,6 +245,20 @@ def index_repository(repo_id: str, repo_path: str, owner_id: str, files: list,
 
             indexed_files += 1
 
+        except QuotaExceededError:
+            # Arrêt immédiat de la boucle : le quota ne va pas se régénérer
+            # entre deux fichiers du même job, donc continuer ne ferait
+            # qu'accumuler des échecs identiques jusqu'à la fin de la liste.
+            # Ce fichier n'est PAS ajouté à failed_files — ce n'est pas un
+            # problème propre à lui, c'est un arrêt global du job (voir
+            # main.py, qui traite quota_exceeded distinctement de failed_files).
+            quota_exceeded = True
+            print(
+                f"Gemini quota exceeded while indexing {relative_path} — "
+                f"stopping after {indexed_files}/{len(files)} files.",
+                flush=True,
+            )
+            break
         except UnicodeDecodeError:
             failed_files.append({"path": relative_path, "reason": "File is not valid UTF-8 text"})
             print(f"Error indexing {path}: not valid UTF-8", flush=True)
@@ -258,4 +273,5 @@ def index_repository(repo_id: str, repo_path: str, owner_id: str, files: list,
         "indexed_files": indexed_files,
         "total_chunks": total_chunks,
         "failed_files": failed_files,
+        "quota_exceeded": quota_exceeded,
     }

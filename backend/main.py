@@ -216,6 +216,24 @@ def _run_indexing_job(repo_id: str, repo_url: str, owner_id: str, access_token: 
                 known_failures=skipped_files, on_progress=on_progress,
             )
 
+            if index_result["quota_exceeded"]:
+                # Stage dédié, distinct de "error" : ce n'est pas un fichier
+                # qui a un problème, c'est le quota Gemini du compte qui est
+                # épuisé — et surtout, contrairement à "error", ce repo reste
+                # utilisable pour ce qui a déjà été indexé (voir /ask, qui
+                # accepte explicitement ce stage tant que total_chunks > 0).
+                set_job(
+                    stage="quota_exceeded",
+                    indexed_files=index_result["indexed_files"],
+                    total_chunks=index_result["total_chunks"],
+                    failed_files=index_result["failed_files"],
+                    error=f"Gemini API quota reached after indexing "
+                    f"{index_result['indexed_files']}/{len(files)} files. What's already "
+                    f"indexed is still usable — try asking a question below. Re-index "
+                    f"later (or wait a few minutes) to pick up the rest.",
+                )
+                return
+
             if index_result["total_chunks"] == 0:
                 set_job(
                     stage="error",
@@ -422,12 +440,23 @@ def ask(req: AskRequest, request: Request):
     finally:
         db.close()
 
-    # On exige la propriété ET stage == "ready", pas seulement l'existence
-    # du Repo : le Repo est créé dès la mise en file (avant même le clone),
-    # donc sans ce contrôle un repo encore en cours d'indexation, en échec,
-    # ou appartenant à quelqu'un d'autre renverrait soit une réponse
-    # dégradée (0 chunk trouvé), soit une fuite de contenu entre comptes.
-    if repo is None or repo.owner_id != current_user.id or job is None or job.stage != "ready":
+    # On exige la propriété ET un stage interrogeable, pas seulement
+    # l'existence du Repo : le Repo est créé dès la mise en file (avant même
+    # le clone), donc sans ce contrôle un repo encore en cours d'indexation,
+    # en échec, ou appartenant à quelqu'un d'autre renverrait soit une
+    # réponse dégradée (0 chunk trouvé), soit une fuite de contenu entre
+    # comptes. "quota_exceeded" est volontairement interrogeable : le repo
+    # est partiellement indexé, pas perdu — voir _run_indexing_job. Le garde
+    # total_chunks > 0 exclut le cas où le quota a été atteint dès le
+    # premier fichier (rien à interroger).
+    QUERYABLE_STAGES = {"ready", "quota_exceeded"}
+    if (
+        repo is None
+        or repo.owner_id != current_user.id
+        or job is None
+        or job.stage not in QUERYABLE_STAGES
+        or job.total_chunks == 0
+    ):
         return JSONResponse(status_code=404, content={"error": "repo not found"})
 
     try:
