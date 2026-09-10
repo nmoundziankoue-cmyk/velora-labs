@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -28,6 +28,27 @@ class User(Base):
     github_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
     github_login: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    # Facturation (Stripe). Ces colonnes sont ajoutées à la table `users`
+    # existante par migrations.py (create_all() n'ajoute jamais de colonne
+    # à une table déjà présente en prod), pas seulement ici. Les
+    # server_default gardent le DDL de create_all() (base neuve) aligné sur
+    # ce que la migration produit (base existante). Rien ne facture tant que
+    # BILLING_ENFORCED=false — le gating/les endpoints viennent après.
+    stripe_customer_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # none | active | past_due | canceled
+    subscription_status: Mapped[str] = mapped_column(
+        String, nullable=False, default="none", server_default=text("'none'")
+    )
+    # true = compte beta grandfathered (gratuit même quand le gating est
+    # actif). Backfillé à true pour tous les comptes déjà en base par la
+    # migration ; pour les nouveaux comptes la valeur sera posée
+    # explicitement dans le code de signup (à venir), ce default n'est qu'un
+    # filet.
+    is_beta: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
 
     repos: Mapped[list["Repo"]] = relationship(back_populates="owner")
     sessions: Mapped[list["UserSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")

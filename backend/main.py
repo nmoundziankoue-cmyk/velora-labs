@@ -53,17 +53,19 @@ import auth
 import github_oauth
 from database import Base, SessionLocal, engine
 from models import Job, Repo, User
+from migrations import run_migrations
 from ingest import ALLOWED_EXTENSIONS, MAX_FILE_SIZE_BYTES, clone_repository, get_code_files, index_repository, RepoCloneError
 from retrieval import retrieve_context, RetrievalError
 from llm import generate_answer, GenerationError
 
 app = FastAPI(title="Velora API")
 
-# Crée les tables si elles n'existent pas encore. Pas d'Alembic à ce stade :
-# le schéma est neuf, sans donnée de prod à faire migrer — `create_all` est
-# idempotent et suffisant. À reconsidérer si le schéma doit évoluer alors
-# que de vraies données existent déjà.
+# create_all() crée les tables manquantes mais n'ajoute JAMAIS de colonne à
+# une table qui existe déjà (cas de la prod). run_migrations() rattrape ça
+# avec des ALTER idempotents — voir migrations.py. Ordre important :
+# create_all() d'abord (les tables doivent exister), migrations ensuite.
 Base.metadata.create_all(bind=engine)
+run_migrations()
 
 # ===== CORS =====
 # Frontend (Vercel) et backend (Render) sont deux origines différentes en
