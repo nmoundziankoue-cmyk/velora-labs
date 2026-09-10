@@ -19,6 +19,10 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
+import observability
+
+observability.init_sentry()  # avant les checks ci-dessous : capture aussi un crash au démarrage si Sentry est configuré
+
 # Le SDK google-genai a besoin de GEMINI_API_KEY pour authentifier chaque
 # appel embeddings/chat. On échoue immédiatement au démarrage plutôt que de
 # laisser chaque requête planter individuellement avec une erreur cryptique.
@@ -153,106 +157,151 @@ class AskRequest(BaseModel):
 # threads — voir _run_indexing_job.
 
 def _run_indexing_job(repo_id: str, repo_url: str, owner_id: str, access_token: str | None):
+    job_logger = observability.get_job_logger(repo_id=repo_id, owner_id=owner_id)
+    job_logger.info("indexing job started")
+    job_start = time.time()
+
     db = SessionLocal()
+    repo_path = None
 
     def set_job(**fields):
         db.query(Job).filter(Job.repo_id == repo_id).update(fields)
         db.commit()
 
     try:
-        set_job(stage="cloning")
-
         try:
-            repo_path = clone_repository(repo_url, repo_id, access_token=access_token)
-        except RepoCloneError as e:
-            set_job(stage="error", error=str(e))
-            return
-        finally:
-            # Le token n'a plus d'utilité passé cet appel, qu'il ait réussi
-            # ou échoué — jeté immédiatement, pas seulement en fin de job
-            # (voir POLICY.md). Il n'a de toute façon jamais été écrit en base.
-            access_token = None
+            set_job(stage="cloning")
 
-        try:
-            set_job(stage="reading_files")
-            files, skipped_files = get_code_files(repo_path)
-            set_job(files_found=len(files), failed_files=skipped_files)
+            try:
+                repo_path = clone_repository(repo_url, repo_id, access_token=access_token)
+            except RepoCloneError as e:
+                job_logger.warning(f"clone failed: {e}")
+                set_job(stage="error", error=str(e))
+                return
+            finally:
+                # Le token n'a plus d'utilité passé cet appel, qu'il ait
+                # réussi ou échoué — jeté immédiatement, pas seulement en
+                # fin de job (voir POLICY.md). Il n'a de toute façon jamais
+                # été écrit en base, ni journalisé.
+                access_token = None
 
-            if len(files) > MAX_FILES_PER_REPO:
-                set_job(
-                    stage="error",
-                    error=f"Repo too large ({len(files)} files, max {MAX_FILES_PER_REPO} "
-                    f"for this demo). Try a smaller repo.",
+            try:
+                set_job(stage="reading_files")
+                files, skipped_files = get_code_files(repo_path)
+                set_job(files_found=len(files), failed_files=skipped_files)
+
+                if len(files) > MAX_FILES_PER_REPO:
+                    job_logger.warning(f"repo too large: {len(files)} files (max {MAX_FILES_PER_REPO})")
+                    set_job(
+                        stage="error",
+                        error=f"Repo too large ({len(files)} files, max {MAX_FILES_PER_REPO} "
+                        f"for this demo). Try a smaller repo.",
+                    )
+                    return
+
+                if len(files) == 0:
+                    if skipped_files:
+                        # Distinguer ce cas de "aucun fichier reconnu" : la
+                        # cause réelle n'est pas l'absence de code, mais une
+                        # taille excessive — visible dans failed_files déjà,
+                        # mais le message d'erreur doit le dire clairement aussi.
+                        job_logger.warning(f"all {len(skipped_files)} matching files were too large")
+                        set_job(
+                            stage="error",
+                            error=f"All {len(skipped_files)} matching files were too large to "
+                            f"index (max {MAX_FILE_SIZE_BYTES // 1024} KB each). Try a smaller repo.",
+                        )
+                    else:
+                        job_logger.warning("no supported source files found")
+                        extensions = ", ".join(sorted(ALLOWED_EXTENSIONS))
+                        set_job(
+                            stage="error",
+                            error=f"No supported source files found in this repository. "
+                            f"Supported extensions: {extensions}.",
+                        )
+                    return
+
+                job_logger.info(f"indexing started: {len(files)} files")
+                set_job(stage="indexing")
+
+                def on_progress(indexed_files, total_chunks, files_total, failed_files):
+                    set_job(indexed_files=indexed_files, total_chunks=total_chunks, failed_files=failed_files)
+
+                index_result = index_repository(
+                    repo_id, repo_path, owner_id=owner_id, files=files,
+                    known_failures=skipped_files, on_progress=on_progress,
                 )
-                return
 
-            if len(files) == 0:
-                if skipped_files:
-                    # Distinguer ce cas de "aucun fichier reconnu" : la
-                    # cause réelle n'est pas l'absence de code, mais une
-                    # taille excessive — visible dans failed_files déjà,
-                    # mais le message d'erreur doit le dire clairement aussi.
+                if index_result["quota_exceeded"]:
+                    # Stage dédié, distinct de "error" : ce n'est pas un
+                    # fichier qui a un problème, c'est le quota Gemini du
+                    # compte qui est épuisé — et surtout, contrairement à
+                    # "error", ce repo reste utilisable pour ce qui a déjà
+                    # été indexé (voir /ask, qui accepte explicitement ce
+                    # stage tant que total_chunks > 0).
+                    job_logger.warning(
+                        f"quota exceeded after {index_result['indexed_files']}/{len(files)} files"
+                    )
+                    observability.capture_quota_exceeded(
+                        repo_id=repo_id,
+                        owner_id=owner_id,
+                        indexed_files=index_result["indexed_files"],
+                        files_total=len(files),
+                    )
+                    set_job(
+                        stage="quota_exceeded",
+                        indexed_files=index_result["indexed_files"],
+                        total_chunks=index_result["total_chunks"],
+                        failed_files=index_result["failed_files"],
+                        error=f"Gemini API quota reached after indexing "
+                        f"{index_result['indexed_files']}/{len(files)} files. What's already "
+                        f"indexed is still usable — try asking a question below. Re-index "
+                        f"later (or wait a few minutes) to pick up the rest.",
+                    )
+                    return
+
+                if index_result["total_chunks"] == 0:
+                    job_logger.error("indexing failed for every file")
                     set_job(
                         stage="error",
-                        error=f"All {len(skipped_files)} matching files were too large to "
-                        f"index (max {MAX_FILE_SIZE_BYTES // 1024} KB each). Try a smaller repo.",
+                        failed_files=index_result["failed_files"],
+                        error="Indexing failed for every file (likely a temporary Gemini "
+                        "API issue). Try again in a moment.",
                     )
-                else:
-                    extensions = ", ".join(sorted(ALLOWED_EXTENSIONS))
-                    set_job(
-                        stage="error",
-                        error=f"No supported source files found in this repository. "
-                        f"Supported extensions: {extensions}.",
-                    )
-                return
+                    return
 
-            set_job(stage="indexing")
-
-            def on_progress(indexed_files, total_chunks, files_total, failed_files):
-                set_job(indexed_files=indexed_files, total_chunks=total_chunks, failed_files=failed_files)
-
-            index_result = index_repository(
-                repo_id, repo_path, owner_id=owner_id, files=files,
-                known_failures=skipped_files, on_progress=on_progress,
-            )
-
-            if index_result["quota_exceeded"]:
-                # Stage dédié, distinct de "error" : ce n'est pas un fichier
-                # qui a un problème, c'est le quota Gemini du compte qui est
-                # épuisé — et surtout, contrairement à "error", ce repo reste
-                # utilisable pour ce qui a déjà été indexé (voir /ask, qui
-                # accepte explicitement ce stage tant que total_chunks > 0).
+                elapsed = time.time() - job_start
+                job_logger.info(
+                    f"indexing finished in {elapsed:.1f}s: "
+                    f"{index_result['indexed_files']}/{len(files)} files, "
+                    f"{index_result['total_chunks']} chunks, "
+                    f"{len(index_result['failed_files'])} failed"
+                )
                 set_job(
-                    stage="quota_exceeded",
                     indexed_files=index_result["indexed_files"],
                     total_chunks=index_result["total_chunks"],
                     failed_files=index_result["failed_files"],
-                    error=f"Gemini API quota reached after indexing "
-                    f"{index_result['indexed_files']}/{len(files)} files. What's already "
-                    f"indexed is still usable — try asking a question below. Re-index "
-                    f"later (or wait a few minutes) to pick up the rest.",
+                    stage="ready",
                 )
-                return
-
-            if index_result["total_chunks"] == 0:
-                set_job(
-                    stage="error",
-                    failed_files=index_result["failed_files"],
-                    error="Indexing failed for every file (likely a temporary Gemini "
-                    "API issue). Try again in a moment.",
-                )
-                return
-
-            set_job(
-                indexed_files=index_result["indexed_files"],
-                total_chunks=index_result["total_chunks"],
-                failed_files=index_result["failed_files"],
-                stage="ready",
-            )
-        finally:
-            # Politique de rétention (POLICY.md) : purge garantie, succès ou
-            # échec — même principe qu'avant le passage en base de données.
-            shutil.rmtree(repo_path, ignore_errors=True)
+            finally:
+                # Politique de rétention (POLICY.md) : purge garantie,
+                # succès ou échec — même principe qu'avant le passage en
+                # base de données.
+                if repo_path:
+                    shutil.rmtree(repo_path, ignore_errors=True)
+        except Exception as e:
+            # Filet de sécurité : une exception inattendue ici tuerait le
+            # thread en silence (Sentry ne capture pas automatiquement les
+            # exceptions de threading.Thread, seulement le cycle de vie
+            # d'une requête HTTP) — sans ce bloc, le job resterait bloqué
+            # indéfiniment sur son dernier stage connu, sans que personne
+            # ne soit prévenu.
+            job_logger.exception("unexpected error in indexing job")
+            observability.capture_exception(e)
+            try:
+                set_job(stage="error", error="Internal error during indexing. Please try again.")
+            except Exception:
+                pass  # si même la mise à jour du job échoue (ex: DB down), rien de plus à faire ici
     finally:
         db.close()
 

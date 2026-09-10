@@ -5,13 +5,16 @@ import sys
 import subprocess
 
 # Défense en profondeur si ce module tourne hors du process main.py
-# (ex: script standalone) : évite un crash ascii sur print() en dessous.
+# (ex: script standalone) : évite un crash ascii sur les logs en dessous.
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from embeddings import embed_text, QuotaExceededError
+from observability import get_logger
 from vector_store import add_chunk
+
+logger = get_logger("velora.ingest")
 
 REPOS_DIR = "repos"
 CHUNK_SIZE = 1200
@@ -197,7 +200,8 @@ def index_repository(repo_id: str, repo_path: str, owner_id: str, files: list,
     cosmétique. `failed_files` grandit au fil de l'indexation : chaque
     échec (fichier trop volumineux, encodage invalide, erreur Gemini
     persistante, etc.) y apparaît avec son chemin et sa raison — plus
-    aucun échec n'est absorbé silencieusement dans un simple print().
+    aucun échec n'est absorbé silencieusement (chaque échec est aussi
+    journalisé via `logger`, voir observability.py).
     """
     indexed_files = 0
     total_chunks = 0
@@ -253,18 +257,17 @@ def index_repository(repo_id: str, repo_path: str, owner_id: str, files: list,
             # problème propre à lui, c'est un arrêt global du job (voir
             # main.py, qui traite quota_exceeded distinctement de failed_files).
             quota_exceeded = True
-            print(
-                f"Gemini quota exceeded while indexing {relative_path} — "
-                f"stopping after {indexed_files}/{len(files)} files.",
-                flush=True,
+            logger.warning(
+                f"repo_id={repo_id} quota exceeded while indexing {relative_path} — "
+                f"stopping after {indexed_files}/{len(files)} files"
             )
             break
         except UnicodeDecodeError:
             failed_files.append({"path": relative_path, "reason": "File is not valid UTF-8 text"})
-            print(f"Error indexing {path}: not valid UTF-8", flush=True)
+            logger.warning(f"repo_id={repo_id} file={relative_path} not valid UTF-8")
         except Exception as e:
             failed_files.append({"path": relative_path, "reason": str(e)})
-            print(f"Error indexing {path}: {e}", flush=True)
+            logger.warning(f"repo_id={repo_id} file={relative_path} error: {e}")
 
         if on_progress:
             on_progress(indexed_files, total_chunks, len(files), failed_files)
